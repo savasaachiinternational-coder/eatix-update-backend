@@ -43,45 +43,59 @@ export const DEMO_PASSWORD = 'EatwazeReview2026!';
 const CUSTOMER_EMAIL = 'apple.review.customer@eatwaze.com';
 const PRIMARY_OWNER_EMAIL = 'apple.review.owner@eatwaze.com';
 
-/** Royalty-free food clips (Mixkit) — branded as restaurant shorts, not mock placeholders. */
+/** Rewrite retired Mixkit preview paths (HTTP 403) to current CDN URLs. */
+function rewriteMixkitPreviewUrl(url: string | null | undefined): string {
+  const raw = String(url || '').trim();
+  const match = raw.match(
+    /^(https?:\/\/assets\.mixkit\.co\/videos\/preview\/)mixkit-.+-(\d+)(?:-large)?\.mp4(?:\?.*)?$/i,
+  );
+  if (!match) return raw;
+  const id = match[2];
+  return `https://assets.mixkit.co/videos/${id}/${id}-720.mp4`;
+}
+
+/**
+ * Royalty-free food clips (Mixkit). Use `/videos/{id}/{id}-720.mp4` —
+ * the old `/videos/preview/...-large.mp4` paths now return HTTP 403.
+ */
 const FOOD_VIDEOS = [
   {
-    url: 'https://assets.mixkit.co/videos/preview/mixkit-serving-a-plate-of-food-in-a-restaurant-2243-large.mp4',
+    url: 'https://assets.mixkit.co/videos/2243/2243-720.mp4',
     thumb:
       'https://images.unsplash.com/photo-1414235077428-338989a2e8c0?w=640&q=80',
     title: 'Tonight’s special',
     description: 'Fresh plates coming out of the kitchen — book a table or order in-app.',
   },
   {
-    url: 'https://assets.mixkit.co/videos/preview/mixkit-pasta-with-tomato-sauce-close-up-2298-large.mp4',
+    url: 'https://assets.mixkit.co/videos/2298/2298-720.mp4',
     thumb:
       'https://images.unsplash.com/photo-1621996346565-e3dbc646d9a9?w=640&q=80',
     title: 'Handmade pasta',
     description: 'Tomato sauce simmered all afternoon. Available for collection & delivery.',
   },
   {
-    url: 'https://assets.mixkit.co/videos/preview/mixkit-chef-preparing-a-meal-in-a-restaurant-kitchen-4272-large.mp4',
+    url: 'https://assets.mixkit.co/videos/4272/4272-720.mp4',
     thumb:
       'https://images.unsplash.com/photo-1556910103-1c02745aae4d?w=640&q=80',
     title: 'Behind the pass',
     description: 'A quick look at how we prep lunch service.',
   },
   {
-    url: 'https://assets.mixkit.co/videos/preview/mixkit-pouring-coffee-into-a-cup-2285-large.mp4',
+    url: 'https://assets.mixkit.co/videos/2285/2285-720.mp4',
     thumb:
       'https://images.unsplash.com/photo-1495474472287-4d71bcdd2085?w=640&q=80',
     title: 'Morning brew',
     description: 'Espresso & brunch until 11:30. Open for walk-ins.',
   },
   {
-    url: 'https://assets.mixkit.co/videos/preview/mixkit-salad-preparation-close-up-2240-large.mp4',
+    url: 'https://assets.mixkit.co/videos/2240/2240-720.mp4',
     thumb:
       'https://images.unsplash.com/photo-1512621776951-a57141f2eefd?w=640&q=80',
     title: 'Garden salad',
     description: 'Seasonal greens with house dressing.',
   },
   {
-    url: 'https://assets.mixkit.co/videos/preview/mixkit-burger-with-fries-and-a-soft-drink-on-a-table-42294-large.mp4',
+    url: 'https://assets.mixkit.co/videos/42294/42294-720.mp4',
     thumb:
       'https://images.unsplash.com/photo-1550547660-d9450f859349?w=640&q=80',
     title: 'Weekend burger',
@@ -591,6 +605,27 @@ async function runSeed(prisma: PrismaClient) {
   }
 
   console.log('App Review seed complete.');
+
+  // Repair older App Review rows that still store Mixkit `/videos/preview/...`
+  // paths (those now 403). Idempotent — only rewrites matching URLs.
+  const broken = await prisma.short.findMany({
+    where: { videoUrl: { contains: 'assets.mixkit.co/videos/preview/' } },
+    select: { id: true, videoUrl: true },
+  });
+  let repaired = 0;
+  for (const row of broken) {
+    const next = rewriteMixkitPreviewUrl(row.videoUrl);
+    if (!next || next === row.videoUrl) continue;
+    await prisma.short.update({
+      where: { id: row.id },
+      data: { videoUrl: next },
+    });
+    repaired += 1;
+  }
+  if (repaired > 0) {
+    console.log(`Repaired ${repaired} Mixkit preview videoUrl(s).`);
+  }
+
   console.log(
     JSON.stringify(
       {

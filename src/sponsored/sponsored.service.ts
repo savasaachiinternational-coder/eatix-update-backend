@@ -7,6 +7,10 @@ import {
 import { PrismaService } from '../prisma/prisma.service';
 import { CreateSponsoredDto } from './dto/create-sponsored.dto';
 import { UpdateSponsoredDto } from './dto/update-sponsored.dto';
+import { cacheDelete, cacheGetOrSet } from '../common/ttl-cache.util';
+
+const SPONSORED_PUBLIC_TTL_MS = 45_000;
+const SPONSORED_PUBLIC_CACHE_KEY = 'sponsored:public:active';
 
 @Injectable()
 export class SponsoredService {
@@ -149,7 +153,7 @@ export class SponsoredService {
       );
     }
 
-    return this.prisma.sponsoredVideo.create({
+    const created = await this.prisma.sponsoredVideo.create({
       data: {
         videoId: dto.videoId,
         userId: ownerId,
@@ -181,6 +185,8 @@ export class SponsoredService {
         },
       },
     });
+    cacheDelete(SPONSORED_PUBLIC_CACHE_KEY);
+    return created;
   }
 
   /** List sponsored: admin sees all, owner sees own */
@@ -215,28 +221,43 @@ export class SponsoredService {
 
   /** Public: list active sponsored campaigns */
   async findAllPublic() {
-    const list = await this.prisma.sponsoredVideo.findMany({
-      where: { status: 'active' },
-      orderBy: { createdAt: 'desc' },
-      include: {
-        video: {
-          select: {
-            id: true,
-            title: true,
-            thumbnailUrl: true,
-            viewCount: true,
+    return cacheGetOrSet(
+      SPONSORED_PUBLIC_CACHE_KEY,
+      SPONSORED_PUBLIC_TTL_MS,
+      async () => {
+        const now = new Date();
+        const list = await this.prisma.sponsoredVideo.findMany({
+          where: {
+            status: 'active',
+            startDate: { lte: now },
+            endDate: { gte: now },
           },
-        },
-        user: {
-          select: {
-            id: true,
-            name: true,
-            nickname: true,
+          orderBy: { createdAt: 'desc' },
+          take: 40,
+          include: {
+            video: {
+              select: {
+                id: true,
+                title: true,
+                thumbnailUrl: true,
+                viewCount: true,
+              },
+            },
+            user: {
+              select: {
+                id: true,
+                name: true,
+                nickname: true,
+                photos: true,
+                latitude: true,
+                longitude: true,
+              },
+            },
           },
-        },
+        });
+        return { sponsored: list };
       },
-    });
-    return { sponsored: list };
+    );
   }
 
   async findOne(id: string) {
@@ -267,7 +288,7 @@ export class SponsoredService {
     const data: any = { ...dto };
     if (dto.startDate) data.startDate = new Date(dto.startDate);
     if (dto.endDate) data.endDate = new Date(dto.endDate);
-    return this.prisma.sponsoredVideo.update({
+    const updated = await this.prisma.sponsoredVideo.update({
       where: { id },
       data,
       include: {
@@ -275,6 +296,8 @@ export class SponsoredService {
         user: { select: { id: true, name: true, nickname: true } },
       },
     });
+    cacheDelete(SPONSORED_PUBLIC_CACHE_KEY);
+    return updated;
   }
 
   async remove(id: string, userId: string, userRole: string) {
@@ -289,6 +312,7 @@ export class SponsoredService {
       where: { id },
       data: { status: 'cancelled' },
     });
+    cacheDelete(SPONSORED_PUBLIC_CACHE_KEY);
     return { message: 'Sponsored campaign cancelled' };
   }
 }

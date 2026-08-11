@@ -31,7 +31,6 @@ import {
   canViewerSeeCreatorContent,
   creatorRoleWhereForViewer,
   effectiveNearbyRadiusKm,
-  isCreatorVisibleToViewer,
   normalizeViewerRole,
 } from '../common/content-visibility.util';
 
@@ -280,16 +279,7 @@ export class PostService {
       if (!canViewerSeeCreatorContent(viewerRoleNorm, profileUser.role)) {
         return emptyResult;
       }
-      const viewingOwnProfile =
-        !!viewerUserId && String(viewerUserId) === String(userId);
-      const lat = viewerLat ?? nearbyLat;
-      const lng = viewerLng ?? nearbyLng;
-      if (
-        !viewingOwnProfile &&
-        !isCreatorVisibleToViewer(viewerRoleNorm, lat, lng, profileUser)
-      ) {
-        return emptyResult;
-      }
+      // Direct profile posts: skip content-area distance gate (same as shorts/videos).
       where.userId = userId;
     }
 

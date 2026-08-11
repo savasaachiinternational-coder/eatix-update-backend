@@ -7,6 +7,10 @@ import {
 import { PrismaService } from '../prisma/prisma.service';
 import { CreateFeaturedDto } from './dto/create-featured.dto';
 import { UpdateFeaturedDto } from './dto/update-featured.dto';
+import { cacheDelete, cacheGetOrSet } from '../common/ttl-cache.util';
+
+const FEATURED_PUBLIC_TTL_MS = 45_000;
+const FEATURED_PUBLIC_CACHE_KEY = 'featured:public:active';
 
 @Injectable()
 export class FeaturedService {
@@ -135,7 +139,7 @@ export class FeaturedService {
       );
     }
 
-    return this.prisma.featuredVideo.create({
+    const created = await this.prisma.featuredVideo.create({
       data: {
         videoId: dto.videoId,
         userId: ownerId,
@@ -167,6 +171,8 @@ export class FeaturedService {
         },
       },
     });
+    cacheDelete(FEATURED_PUBLIC_CACHE_KEY);
+    return created;
   }
 
   async findAll(userId: string, userRole: string) {
@@ -199,28 +205,39 @@ export class FeaturedService {
   }
 
   async findAllPublic() {
-    const list = await this.prisma.featuredVideo.findMany({
-      where: { status: 'active' },
-      orderBy: { createdAt: 'desc' },
-      include: {
-        video: {
-          select: {
-            id: true,
-            title: true,
-            thumbnailUrl: true,
-            viewCount: true,
+    return cacheGetOrSet(FEATURED_PUBLIC_CACHE_KEY, FEATURED_PUBLIC_TTL_MS, async () => {
+      const now = new Date();
+      const list = await this.prisma.featuredVideo.findMany({
+        where: {
+          status: 'active',
+          startDate: { lte: now },
+          endDate: { gte: now },
+        },
+        orderBy: { createdAt: 'desc' },
+        take: 40,
+        include: {
+          video: {
+            select: {
+              id: true,
+              title: true,
+              thumbnailUrl: true,
+              viewCount: true,
+            },
+          },
+          user: {
+            select: {
+              id: true,
+              name: true,
+              nickname: true,
+              photos: true,
+              latitude: true,
+              longitude: true,
+            },
           },
         },
-        user: {
-          select: {
-            id: true,
-            name: true,
-            nickname: true,
-          },
-        },
-      },
+      });
+      return { featured: list };
     });
-    return { featured: list };
   }
 
   async findOne(id: string) {
@@ -251,7 +268,7 @@ export class FeaturedService {
     const data: any = { ...dto };
     if (dto.startDate) data.startDate = new Date(dto.startDate);
     if (dto.endDate) data.endDate = new Date(dto.endDate);
-    return this.prisma.featuredVideo.update({
+    const updated = await this.prisma.featuredVideo.update({
       where: { id },
       data,
       include: {
@@ -259,6 +276,8 @@ export class FeaturedService {
         user: { select: { id: true, name: true, nickname: true } },
       },
     });
+    cacheDelete(FEATURED_PUBLIC_CACHE_KEY);
+    return updated;
   }
 
   async remove(id: string, userId: string, userRole: string) {
@@ -273,6 +292,7 @@ export class FeaturedService {
       where: { id },
       data: { status: 'cancelled' },
     });
+    cacheDelete(FEATURED_PUBLIC_CACHE_KEY);
     return { message: 'Featured campaign cancelled' };
   }
 }

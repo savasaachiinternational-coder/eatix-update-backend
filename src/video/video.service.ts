@@ -28,12 +28,11 @@ import {
   multerFileFromBuffer,
 } from '../common/video-thumbnail.util';
 import { UK_DEFAULT_RADIUS_KM } from '../common/geo.util';
+import { resolveNearbyUserIds } from '../common/nearby-users.cache';
 import {
   assertViewerCanSeeCreatorContent,
   canViewerSeeCreatorContent,
   creatorRoleWhereForViewer,
-  effectiveNearbyRadiusKm,
-  isCreatorVisibleToViewer,
   normalizeViewerRole,
 } from '../common/content-visibility.util';
 
@@ -241,38 +240,13 @@ export class VideoService {
     }
 
     if (nearbyLat != null && nearbyLng != null) {
-      const usersWithLocation = await this.prisma.user.findMany({
-        where: {
-          latitude: { not: null },
-          longitude: { not: null },
-        },
-        select: {
-          id: true,
-          role: true,
-          latitude: true,
-          longitude: true,
-          contentAreaKm: true,
-          pickupAreaKm: true,
-          deliveryAreaKm: true,
-        },
-      });
-      const nearbyUserIds = usersWithLocation
-        .filter((u) => {
-          if (u.latitude == null || u.longitude == null) return false;
-          const distanceKm = this.haversineKm(
-            nearbyLat,
-            nearbyLng,
-            u.latitude,
-            u.longitude,
-          );
-          const effectiveRadiusKm = effectiveNearbyRadiusKm(
-            viewerRole,
-            u,
-            radiusKm,
-          );
-          return distanceKm <= effectiveRadiusKm;
-        })
-        .map((u) => u.id);
+      const nearbyUserIds = await resolveNearbyUserIds(
+        this.prisma,
+        nearbyLat,
+        nearbyLng,
+        radiusKm,
+        viewerRole,
+      );
       where.userId = { in: nearbyUserIds.length > 0 ? nearbyUserIds : [''] };
     }
 
@@ -343,12 +317,10 @@ export class VideoService {
               id: true,
               name: true,
               nickname: true,
-              email: true,
-              phone: true,
-              address: true,
+              role: true,
+              photos: true,
               latitude: true,
               longitude: true,
-              role: true,
             },
           },
           _count: {
@@ -1220,25 +1192,12 @@ export class VideoService {
       viewerRoleNorm = normalizeViewerRole(viewer?.role);
     }
 
-    const viewingOwnProfile =
-      !!options?.viewerUserId &&
-      String(options.viewerUserId) === String(userId);
-
     if (!canViewerSeeCreatorContent(viewerRoleNorm, profileUser.role)) {
       return empty;
     }
 
-    if (
-      !viewingOwnProfile &&
-      !isCreatorVisibleToViewer(
-        viewerRoleNorm,
-        options?.viewerLat,
-        options?.viewerLng,
-        profileUser,
-      )
-    ) {
-      return empty;
-    }
+    // Direct profile lookup: do not blank the Videos tab based on content-area
+    // distance. Nearby discovery already enforces geo separately.
 
     const skip = (page - 1) * limit;
     const now = new Date();

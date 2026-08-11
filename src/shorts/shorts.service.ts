@@ -31,13 +31,13 @@ import { ShortsTranscodeService } from './shorts-transcode.service';
 import {
   extractVideoThumbnailFromPath,
 } from '../common/video-thumbnail.util';
+import { withNormalizedShortVideoUrl } from '../common/normalize-short-video-url.util';
 import { UK_DEFAULT_RADIUS_KM } from '../common/geo.util';
+import { resolveNearbyUserIds } from '../common/nearby-users.cache';
 import {
   assertViewerCanSeeCreatorContent,
   canViewerSeeCreatorContent,
   creatorRoleWhereForViewer,
-  effectiveNearbyRadiusKm,
-  isCreatorVisibleToViewer,
   normalizeViewerRole,
 } from '../common/content-visibility.util';
 import { v4 as uuidv4 } from 'uuid';
@@ -802,38 +802,13 @@ export class ShortsService {
 
     if (userId) where.userId = userId;
     if (nearbyLat != null && nearbyLng != null) {
-      const usersWithLocation = await this.prisma.user.findMany({
-        where: {
-          latitude: { not: null },
-          longitude: { not: null },
-        },
-        select: {
-          id: true,
-          role: true,
-          latitude: true,
-          longitude: true,
-          contentAreaKm: true,
-          pickupAreaKm: true,
-          deliveryAreaKm: true,
-        },
-      });
-      const nearbyUserIds = usersWithLocation
-        .filter((u) => {
-          if (u.latitude == null || u.longitude == null) return false;
-          const distanceKm = this.haversineKm(
-            nearbyLat,
-            nearbyLng,
-            u.latitude,
-            u.longitude,
-          );
-          const effectiveRadiusKm = effectiveNearbyRadiusKm(
-            viewerRole,
-            u,
-            radiusKm,
-          );
-          return distanceKm <= effectiveRadiusKm;
-        })
-        .map((u) => u.id);
+      const nearbyUserIds = await resolveNearbyUserIds(
+        this.prisma,
+        nearbyLat,
+        nearbyLng,
+        radiusKm,
+        viewerRole,
+      );
       where.userId = { in: nearbyUserIds.length > 0 ? nearbyUserIds : [''] };
     }
     if (category) where.category = category;
@@ -865,9 +840,7 @@ export class ShortsService {
               name: true,
               nickname: true,
               role: true,
-              email: true,
-              phone: true,
-              address: true,
+              photos: true,
               latitude: true,
               longitude: true,
             },
@@ -917,7 +890,7 @@ export class ShortsService {
     }
 
     return {
-      shorts: resultShorts,
+      shorts: resultShorts.map((s) => withNormalizedShortVideoUrl(s)),
       pagination: {
         total,
         page,
@@ -1089,7 +1062,7 @@ export class ShortsService {
       );
     }
 
-    return response;
+    return withNormalizedShortVideoUrl(response);
   }
 
   /**
@@ -1693,24 +1666,14 @@ export class ShortsService {
       viewerRoleNorm = normalizeViewerRole(viewer?.role);
     }
 
-    const viewingOwnProfile =
-      !!viewerUserId && String(viewerUserId) === String(userId);
-
     if (!canViewerSeeCreatorContent(viewerRoleNorm, profileUser.role)) {
       return empty;
     }
 
-    if (
-      !viewingOwnProfile &&
-      !isCreatorVisibleToViewer(
-        viewerRoleNorm,
-        options?.viewerLat,
-        options?.viewerLng,
-        profileUser,
-      )
-    ) {
-      return empty;
-    }
+    // Direct profile lookup (`/shorts/user/:userId`): show public content for this
+    // channel regardless of content-area distance. Geo radius applies to nearby /
+    // discovery feeds only — otherwise you can open a restaurant from Shorts and
+    // see an empty Gallery/Videos tab when browsing from another city.
 
     const skip = (page - 1) * limit;
     const viewingOwnShorts =
@@ -1785,7 +1748,7 @@ export class ShortsService {
     }
 
     return {
-      shorts: resultShorts,
+      shorts: resultShorts.map((s) => withNormalizedShortVideoUrl(s)),
       pagination: {
         total,
         page,

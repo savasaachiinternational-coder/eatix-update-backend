@@ -17,6 +17,7 @@ import {
   resolveTaxChargeForDistanceKm,
   resolveOwnerAreaKm,
 } from '../common/geo.util';
+import { cacheGetOrSet } from '../common/ttl-cache.util';
 import { isValidUkPhone, normalizeUkPhone, extractPhoneFromDeliveryAddress } from '../common/phone.util';
 import {
   calcPercentDiscount,
@@ -1354,24 +1355,38 @@ export class RestaurantOrderService {
     const radiusKm = opts?.radiusKm ?? UK_DEFAULT_RADIUS_KM;
 
     if (isValidCoord(nearbyLat) && isValidCoord(nearbyLng)) {
-      const owners = await this.prisma.user.findMany({
-        where: {
-          role: { in: ['owner', 'vendor'] },
-          latitude: { not: null },
-          longitude: { not: null },
-        },
-        select: {
-          id: true,
-          name: true,
-          nickname: true,
-          address: true,
-          postcode: true,
-          photos: true,
-          role: true,
-          latitude: true,
-          longitude: true,
-        },
-      });
+      const owners = await cacheGetOrSet<
+        Array<{
+          id: string;
+          name: string | null;
+          nickname: string | null;
+          address: string | null;
+          postcode: string | null;
+          photos: unknown;
+          role: string | null;
+          latitude: number | null;
+          longitude: number | null;
+        }>
+      >('geo:owners-vendors-with-location', 90_000, () =>
+        this.prisma.user.findMany({
+          where: {
+            role: { in: ['owner', 'vendor'] },
+            latitude: { not: null },
+            longitude: { not: null },
+          },
+          select: {
+            id: true,
+            name: true,
+            nickname: true,
+            address: true,
+            postcode: true,
+            photos: true,
+            role: true,
+            latitude: true,
+            longitude: true,
+          },
+        }),
+      );
 
       const nearby = owners
         .map((o) => {

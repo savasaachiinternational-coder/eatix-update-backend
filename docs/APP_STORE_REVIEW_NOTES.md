@@ -1,7 +1,7 @@
 # App Store Review Notes (Eatwaze)
 
 Paste the **Review Notes** section into App Store Connect when submitting the new app listing.  
-Run the seed against production **before** submitting so demo logins and nearby content work.
+Confirm the demo accounts below work on production **before** submitting.
 
 ## Prerequisites
 
@@ -9,9 +9,18 @@ Run the seed against production **before** submitting so demo logins and nearby 
 2. Privacy Policy URL: `https://eatwaze.com/privacy`
 3. Terms URL: `https://eatwaze.com/terms`
 4. Support URL / website: `https://eatwaze.com`
-5. Seed production data (see below).
+5. Verify demo logins on production (see below).
 
-## Seed production (demo restaurants + shorts + menus)
+## App Store demo accounts (production)
+
+| Role | Email | Password |
+|------|-------|----------|
+| Customer | `mahamud@gmail.com` | `123456` |
+| Restaurant | `info@grandmillon.co.uk` | `123456` |
+
+Restaurant channel for review: **Grand Millon** (Oldham). If asked for a browse area / postcode, use **OL9 6HN** (or the restaurant’s postcode).
+
+### Optional: seed extra London demo data
 
 On a machine that can reach the production Postgres database:
 
@@ -23,19 +32,7 @@ npm run seed:app-review
 
 Or put `DATABASE_URL` in `eatix-backend/.env` and run `npm run seed:app-review`.
 
-The script is idempotent: re-running updates the same demo accounts and refreshes their menus, promos, and shorts.
-
-### What gets created
-
-| Role | Email | Password |
-|------|-------|----------|
-| Customer | `apple.review.customer@eatwaze.com` | `EatwazeReview2026!` |
-| Restaurant (primary) | `apple.review.owner@eatwaze.com` | `EatwazeReview2026!` |
-| Extra restaurants | `apple.review.soho@eatwaze.com`, `…borough…`, `…shoreditch…`, `…camden…` | same password |
-
-All restaurants are placed in **central London** (within the app’s ~15 km nearby radius). The customer account’s location is **Trafalgar Square / WC2N 5DN**.
-
-Promo codes for testing checkout (optional): `EATWAZE10`, `SOHONAAN`, `BOROUGH15`, `SHOREDITCH10`, `CAMDEN12`.
+The seed script is optional when using the real accounts above; it creates extra London demo restaurants if needed.
 
 ---
 
@@ -46,32 +43,44 @@ Thank you for reviewing Eatwaze.
 
 Eatwaze is a UK food discovery app: nearby restaurants, short-form food videos, menus, and promotions.
 
-DEMO ACCOUNTS (password for both: EatwazeReview2026!)
+DEMO ACCOUNTS (password for both: 123456)
 
 Customer (browse / shorts / order flow):
-Email: apple.review.customer@eatwaze.com
-Password: EatwazeReview2026!
+Email: mahamud@gmail.com
+Password: 123456
 
 Restaurant owner (channel / menu / promos):
-Email: apple.review.owner@eatwaze.com
-Password: EatwazeReview2026!
+Email: info@grandmillon.co.uk
+Password: 123456
 
 HOW TO REVIEW
-1. Sign in with the customer account.
-2. If asked for a browse area / postcode, use: WC2N 5DN (central London) or allow location near Trafalgar Square.
-3. Open Shorts / Home — you should see food videos from nearby London restaurants.
-4. Open a restaurant channel (e.g. Covent Garden Kitchen) — profile, menu items, and promotions load from the live API.
+1. Sign in with the customer account (mahamud@gmail.com).
+2. If asked for a browse area / postcode, use: OL9 6HN (Oldham) so nearby content includes Grand Millon.
+3. Open Home / Shorts — browse food videos and nearby restaurants.
+4. Open restaurant channel Grand Millon — profile, menu items, and promotions load from the live API.
 5. Settings → Privacy Policy / Terms / Website open https://eatwaze.com (and /privacy, /terms).
 6. Help / Contact uses support@eatwaze.com.
 
-Owner path (optional): sign out, sign in as apple.review.owner@eatwaze.com to view the restaurant channel tools.
+APPLE PAY (PassKit)
+Apple Pay is integrated via Stripe Payment Sheet during restaurant checkout. It is not a separate menu item and does not appear on Home / Shorts.
+
+How to locate Apple Pay:
+1. Sign in as mahamud@gmail.com / 123456
+2. Set browse postcode to OL9 6HN
+3. Open Grand Millon → add a menu item → proceed to checkout / place order
+4. On the order screen, payment shows “Card / Apple Pay”
+5. Tap place order — Stripe Payment Sheet opens; Apple Pay appears there when the device has Apple Pay / Wallet set up
+
+Merchant ID: merchant.com.eatwaze.app (UK / GB). PassKit is linked because checkout uses @stripe/stripe-react-native with Apple Pay enabled.
+
+Owner path (optional): sign out, sign in as info@grandmillon.co.uk to view the restaurant channel tools.
 
 Legal
 • Privacy Policy: https://eatwaze.com/privacy
 • Terms of Use: https://eatwaze.com/terms
 • Website: https://eatwaze.com
 
-No payment is required to explore core discovery content. Promo codes on demo restaurants are for optional order testing only.
+Core discovery (Home / Shorts / restaurant channel) does not require payment. Apple Pay is only in the paid checkout flow above.
 ```
 
 ---
