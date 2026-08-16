@@ -16,10 +16,13 @@ model User {
   employeeId    String?      @unique
   email         String       @unique
   phone         String?
+  phoneVerified Boolean      @default(false)
+  profileComplete Boolean    @default(false)
   referralCode  String?
   gender        Gender       @default(others)
   password      String?
   address       String?
+  postcode      String?    // UK postcode e.g. WD5 0AB (owner shop / user area)
   latitude      Float?     // For nearby: creator/owner location
   longitude     Float?     // For nearby: creator/owner location
   role          String       @default("user") // Changed from UserRole enum to String
@@ -76,6 +79,18 @@ model User {
   socialLinks         Json?        // Array of { type: string, url: string } e.g. facebook, instagram, x, youtube, google_email, website, others
   savedLastLocation    Json?        // App: last selected area for feed { lat, lng, addressText, savedAt } (per device/login)
   openingHours        Json?        // Owner-only: [{ day: string, open: string, close: string }]
+  deliveryTime        String?      // Owner-only: estimated delivery time label e.g. "30-45 minutes"
+  contentAreaKm       Float?       // Owner-only: browse/content radius (videos, shorts, posts) from shop (km)
+  pickupAreaKm        Float?       // Owner-only: max pickup/collection radius from shop (km)
+  deliveryAreaKm      Float?       // Owner-only: max delivery radius from restaurant location (km)
+  taxCharge0To10Km    Float?       // Owner-only: delivery tax/charge for 0-10 km
+  taxCharge11To20Km   Float?       // Owner-only: delivery tax/charge for 11-20 km
+  taxCharge21To30Km   Float?       // Owner-only: delivery tax/charge for 21-30 km
+  vendorMinOrderQty   Int?         // Vendor-only: minimum quantity per menu line item
+  vendorMaxOrderQty   Int?         // Vendor-only: maximum quantity per menu line item
+  employerId          String?      // Rider-only: restaurant owner who created this rider
+  employer            User?        @relation("OwnerRiders", fields: [employerId], references: [id], onDelete: SetNull)
+  riders              User[]       @relation("OwnerRiders")
   
   // OTP & Password Reset Fields
   otp                  String?      // One-time password
@@ -143,10 +158,17 @@ model User {
   // Restaurant orders: as customer (placed by me) or as restaurant owner (orders for my restaurant)
   restaurantOrdersAsCustomer RestaurantOrder[] @relation("RestaurantOrderCustomer")
   restaurantOrdersAsOwner    RestaurantOrder[] @relation("RestaurantOrderOwner")
+  restaurantOrdersAsRider    RestaurantOrder[] @relation("RestaurantOrderRider")
+  restaurantBookingsAsCustomer RestaurantBooking[] @relation("RestaurantBookingCustomer")
+  restaurantBookingsAsOwner    RestaurantBooking[] @relation("RestaurantBookingOwner")
 
   // Restaurant order reviews: as customer (I wrote the review) or as owner (reviews for my restaurant)
   restaurantOrderReviewsAsCustomer RestaurantOrderReview[] @relation("RestaurantOrderReviewUser")
   restaurantOrderReviewsAsOwner    RestaurantOrderReview[] @relation("RestaurantOrderReviewOwner")
+
+  // Rider reviews: customer wrote review, rider received review
+  restaurantOrderRiderReviewsAsCustomer RestaurantOrderRiderReview[] @relation("RestaurantOrderRiderReviewUser")
+  restaurantOrderRiderReviewsAsRider    RestaurantOrderRiderReview[] @relation("RestaurantOrderRiderReviewRider")
 
   // Vendor featured/sponsored: user with role "vendor" (not the Vendor model)
   vendorFeaturedVideos  VendorFeaturedVideo[]  @relation("UserVendorFeatured")
@@ -175,6 +197,9 @@ model User {
   // Subscription package (upload limits: videos & shorts)
   subscriptionPackageId String?
   subscriptionPackage   SubscriptionPackage? @relation(fields: [subscriptionPackageId], references: [id], onDelete: SetNull)
+
+  blocksMade     UserBlock[] @relation("UserBlocksMade")
+  blocksReceived UserBlock[] @relation("UserBlocksReceived")
 
   @@index([email])
   @@index([subscriptionPackageId])
@@ -1825,6 +1850,21 @@ model ContentReport {
   @@index([reporterId])
 }
 
+model UserBlock {
+  id            String   @id @default(uuid())
+  blockerId     String
+  blockedUserId String
+  reason        String?
+  createdAt     DateTime @default(now())
+
+  blocker User @relation("UserBlocksMade", fields: [blockerId], references: [id], onDelete: Cascade)
+  blocked User @relation("UserBlocksReceived", fields: [blockedUserId], references: [id], onDelete: Cascade)
+
+  @@unique([blockerId, blockedUserId])
+  @@index([blockerId])
+  @@index([blockedUserId])
+}
+
 // ============================================
 // SPONSORED VIDEO - Location-based paid promotion
 // Owner/Admin creates sponsored for an area; when user selects "Use my location", sponsored for that area is shown
@@ -2034,18 +2074,34 @@ model RestaurantOrder {
   ownerId         String      // Restaurant owner
   status          RestaurantOrderStatus @default(pending)
   totalAmount     Float       @default(0)
-  currency        String      @default("BDT")
+  taxCharge       Float       @default(0) // Distance-based delivery tax/charge at order time
+  deliveryDistanceKm Float?   // Customer distance from restaurant when order placed (km)
+  currency        String      @default("GBP")
   deliveryAddress String?     // Optional delivery/notes
+  customerPhone   String?     // Contact phone at time of order
+  fulfillmentType String      @default("delivery") // collection | delivery
+  promotionId     String?
+  promoCode       String?
+  discountAmount  Float       @default(0)
+  paymentStatus   String      @default("unpaid") // unpaid | paid | failed | refunded
+  paymentMethod   String?     // card | google_pay | apple_pay
+  stripePaymentIntentId String? @unique
+  paidAt          DateTime?
+  riderId         String?     // Assigned delivery rider (owner's rider account)
+  assignedAt      DateTime?   // When owner assigned the rider
   createdAt       DateTime    @default(now())
   updatedAt       DateTime    @updatedAt
 
   user   User       @relation("RestaurantOrderCustomer", fields: [userId], references: [id], onDelete: Cascade)
   owner  User       @relation("RestaurantOrderOwner", fields: [ownerId], references: [id], onDelete: Cascade)
+  rider  User?      @relation("RestaurantOrderRider", fields: [riderId], references: [id], onDelete: SetNull)
   items  RestaurantOrderItem[]
   review RestaurantOrderReview?
+  riderReview RestaurantOrderRiderReview?
 
   @@index([userId])
   @@index([ownerId])
+  @@index([riderId])
   @@index([status])
   @@index([createdAt])
 }
@@ -2071,10 +2127,36 @@ model RestaurantOrderReview {
   @@index([createdAt])
 }
 
+// Customer review for delivery rider (one per order, delivery orders only)
+model RestaurantOrderRiderReview {
+  id        String   @id @default(uuid())
+  orderId   String   @unique
+  userId    String   // Customer who reviews
+  riderId   String   // Delivery rider
+  rating    Int      // 1..5
+  comment   String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  order RestaurantOrder @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  user  User            @relation("RestaurantOrderRiderReviewUser", fields: [userId], references: [id], onDelete: Cascade)
+  rider User            @relation("RestaurantOrderRiderReviewRider", fields: [riderId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([riderId])
+  @@index([rating])
+  @@index([createdAt])
+}
+
 enum RestaurantOrderStatus {
   pending
   confirmed
   preparing
+  ready
+  rider_assigned
+  rider_accepted
+  out_for_delivery
+  delivery_complete
   completed
   cancelled
 }
@@ -2094,6 +2176,39 @@ model RestaurantOrderItem {
   @@index([menuItemId])
 }
 
+model RestaurantBooking {
+  id              String   @id @default(uuid())
+  userId          String
+  ownerId         String
+  status          RestaurantBookingStatus @default(pending)
+  customerName    String
+  customerAddress String
+  customerPhone   String
+  persons         Int
+  bookingDate     DateTime
+  promotionId     String?
+  discountPercent Float?
+  note            String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  user  User @relation("RestaurantBookingCustomer", fields: [userId], references: [id], onDelete: Cascade)
+  owner User @relation("RestaurantBookingOwner", fields: [ownerId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([ownerId])
+  @@index([status])
+  @@index([bookingDate])
+  @@index([createdAt])
+}
+
+enum RestaurantBookingStatus {
+  pending
+  confirmed
+  completed
+  cancelled
+}
+
 // ============================================
 // PROMOTION - Owner-only; like post (thumbnail/video) + promoAmount, promoCode, start/expire, menu items
 // ============================================
@@ -2106,8 +2221,12 @@ model Promotion {
   videoUrl      String?   // R2 URL (optional)
   mediaType     String    @default("image") // image | video
   duration      Int?      // Seconds when video
-  promoAmount   Float     // Discount amount or percentage value (e.g. 10 = 10% or 10 BDT per usage)
-  promoCode     String    // Code user enters (e.g. EATIX20)
+  promoAmount   Float     @default(0) // Discount % for order promos (e.g. 10 = 10%)
+  promoCode     String    @default("") // Code user enters (e.g. EATIX20)
+  offerType     String    @default("order") // order | amount_discount | booking_discount
+  fulfillmentScopes String[] @default([]) // collection | delivery | both
+  discountTiers Json?     // [{ minValue, maxValue?, percent, metricType?: amount|people }]
+  tierMetricType String?  // people | amount — default metric for booking_discount tiers
   startDate     DateTime  // When promotion becomes active
   expireDate    DateTime  // When promotion ends
   menuItemIds   String[]  @default([]) // IDs of menu items included in this offer

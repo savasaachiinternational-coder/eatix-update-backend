@@ -135,10 +135,20 @@ export class PlaylistService {
     ]);
 
     const videos = vLikes
-      .filter((v) => v.video?.status !== 'deleted' && v.video?.visibility === 'public')
+      .filter(
+        (v) =>
+          v.video?.status !== 'deleted' &&
+          v.video?.visibility === 'public' &&
+          this.contentVisible(v.video?.scheduledPublishAt ?? null, false),
+      )
       .map((v) => ({ ...v.video, type: 'video' as const, addedAt: v.createdAt }));
     const shorts = sLikes
-      .filter((s) => s.short?.status !== 'deleted' && s.short?.visibility === 'public')
+      .filter(
+        (s) =>
+          s.short?.status !== 'deleted' &&
+          s.short?.visibility === 'public' &&
+          this.shortPublishedVisible(s.short?.publishedAt ?? null, false),
+      )
       .map((s) => ({ ...s.short, type: 'short' as const, addedAt: s.createdAt }));
 
     const combined = [...videos, ...shorts].sort(
@@ -169,10 +179,20 @@ export class PlaylistService {
     ]);
 
     const videos = vLikes
-      .filter((v) => v.video?.status !== 'deleted' && v.video?.visibility === 'public')
+      .filter(
+        (v) =>
+          v.video?.status !== 'deleted' &&
+          v.video?.visibility === 'public' &&
+          this.contentVisible(v.video?.scheduledPublishAt ?? null, false),
+      )
       .map((v) => ({ ...v.video, type: 'video' as const, addedAt: v.createdAt }));
     const shorts = sLikes
-      .filter((s) => s.short?.status !== 'deleted' && s.short?.visibility === 'public')
+      .filter(
+        (s) =>
+          s.short?.status !== 'deleted' &&
+          s.short?.visibility === 'public' &&
+          this.shortPublishedVisible(s.short?.publishedAt ?? null, false),
+      )
       .map((s) => ({ ...s.short, type: 'short' as const, addedAt: s.createdAt }));
 
     const combined = [...videos, ...shorts].sort(
@@ -181,13 +201,44 @@ export class PlaylistService {
     return { items: combined.slice(0, limit), videos, shorts };
   }
 
+  async getPlaylistSummary(userId: string) {
+    if (!userId) throw new BadRequestException('userId is required');
+    const [
+      watchLaterVideos,
+      watchLaterShorts,
+      likedVideos,
+      likedShorts,
+      favVideos,
+      favShorts,
+    ] = await Promise.all([
+      this.prisma.videoWatchLater.count({ where: { userId } }),
+      this.prisma.shortWatchLater.count({ where: { userId } }),
+      this.prisma.videoLike.count({ where: { userId } }),
+      this.prisma.shortLike.count({ where: { userId } }),
+      this.prisma.videoFavorite.count({ where: { userId } }),
+      this.prisma.shortFavorite.count({ where: { userId } }),
+    ]);
+    return {
+      watchLaterCount: watchLaterVideos + watchLaterShorts,
+      likedCount: likedVideos + likedShorts,
+      favoritesCount: favVideos + favShorts,
+    };
+  }
+
   private contentVisible(
     scheduledPublishAt: Date | null,
-    isOwnerContext: boolean,
+    _isOwnerContext: boolean,
   ): boolean {
-    if (isOwnerContext) return true;
     if (!scheduledPublishAt) return true;
     return scheduledPublishAt <= new Date();
+  }
+
+  private shortPublishedVisible(
+    publishedAt: Date | null,
+    _isOwnerContext = false,
+  ): boolean {
+    if (!publishedAt) return true;
+    return publishedAt <= new Date();
   }
 
   async createUserPlaylist(userId: string, name: string) {
@@ -290,6 +341,8 @@ export class PlaylistService {
           include: this.shortInclude,
         });
         if (!s || s.status === 'deleted') continue;
+        if (!this.shortPublishedVisible(s.publishedAt, isChannelOwner))
+          continue;
         if (!isChannelOwner && s.visibility !== 'public') continue;
         out.push({
           ...s,

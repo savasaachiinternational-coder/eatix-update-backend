@@ -1,13 +1,14 @@
-import { ApiProperty } from '@nestjs/swagger';
+import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 import {
   IsString,
   IsArray,
   IsOptional,
   IsNumber,
   Min,
+  IsIn,
   ValidateNested,
 } from 'class-validator';
-import { Type } from 'class-transformer';
+import { Type, Transform } from 'class-transformer';
 
 export class CreateRestaurantOrderItemDto {
   @ApiProperty()
@@ -15,6 +16,7 @@ export class CreateRestaurantOrderItemDto {
   menuItemId: string;
 
   @ApiProperty({ default: 1 })
+  @Transform(({ value }) => Number(value))
   @IsNumber()
   @Min(1)
   quantity: number;
@@ -36,6 +38,13 @@ export class CreateRestaurantOrderDto {
   @IsString()
   deliveryAddress?: string;
 
+  @ApiPropertyOptional({
+    description: 'Customer contact phone (UK). Required for delivery.',
+  })
+  @IsOptional()
+  @IsString()
+  customerPhone?: string;
+
   @ApiProperty({
     required: false,
     description: 'Applied promotion code, if any',
@@ -44,11 +53,44 @@ export class CreateRestaurantOrderDto {
   @IsString()
   promoCode?: string;
 
-  @ApiProperty({
+  @ApiPropertyOptional({
     required: false,
     description: 'Applied promotion ID, if any',
   })
   @IsOptional()
+  @Transform(({ value }) => (value == null ? value : String(value)))
   @IsString()
   promotionId?: string;
+
+  @ApiPropertyOptional({
+    description: 'Customer delivery latitude (for delivery area check)',
+  })
+  @IsOptional()
+  @Type(() => Number)
+  @IsNumber()
+  customerLatitude?: number;
+
+  @ApiPropertyOptional({
+    description: 'Customer delivery longitude (for delivery area check)',
+  })
+  @IsOptional()
+  @Type(() => Number)
+  @IsNumber()
+  customerLongitude?: number;
+
+  @ApiPropertyOptional({
+    enum: ['collection', 'delivery'],
+    default: 'delivery',
+    description: 'collection = pick up at restaurant; delivery = home delivery with rider (Collection)',
+  })
+  @IsOptional()
+  @IsIn(['collection', 'delivery'])
+  fulfillmentType?: 'collection' | 'delivery';
+
+  @ApiPropertyOptional({
+    description: 'Stripe PaymentIntent id after successful checkout',
+  })
+  @IsOptional()
+  @IsString()
+  paymentIntentId?: string;
 }

@@ -20,7 +20,19 @@ import {
   PostCommentLikeDto,
   PostCommentDislikeDto,
   PostCommentDeleteDto,
+  PostCommentUpdateDto,
 } from './dto/post.dto';
+import {
+  extractVideoThumbnailFromMulterFile,
+  multerFileFromBuffer,
+} from '../common/video-thumbnail.util';
+import {
+  assertViewerCanSeeCreatorContent,
+  canViewerSeeCreatorContent,
+  creatorRoleWhereForViewer,
+  effectiveNearbyRadiusKm,
+  normalizeViewerRole,
+} from '../common/content-visibility.util';
 
 @Injectable()
 export class PostService {
@@ -178,19 +190,8 @@ export class PostService {
     }
   }
 
-  /** Hide posts whose publishedAt is in the future unless the viewer is the author. */
-  private applyPublishedVisibility(
-    where: Record<string, unknown>,
-    opts: { profileUserId?: string; viewerUserId?: string },
-  ) {
-    const { profileUserId, viewerUserId } = opts;
-    const viewingOwnProfile =
-      !!profileUserId &&
-      !!viewerUserId &&
-      String(profileUserId) === String(viewerUserId);
-    if (viewingOwnProfile) {
-      return;
-    }
+  /** Hide posts whose publishedAt is in the future from app listing screens. */
+  private applyPublishedVisibility(where: Record<string, unknown>) {
     const now = new Date();
     const pubClause = {
       OR: [{ publishedAt: null }, { publishedAt: { lte: now } }],
@@ -234,47 +235,100 @@ export class PostService {
       radiusKm = 50,
       viewerRole,
       viewerUserId,
+      viewerLat,
+      viewerLng,
     } = query;
 
     const skip = (page - 1) * limit;
     const where: any = {};
 
+    let viewerRoleNorm = normalizeViewerRole(viewerRole);
+    if (!viewerRole && viewerUserId) {
+      const viewer = await this.prisma.user.findUnique({
+        where: { id: viewerUserId },
+        select: { role: true },
+      });
+      viewerRoleNorm = normalizeViewerRole(viewer?.role);
+    }
+
+    const emptyResult = {
+      posts: [],
+      pagination: {
+        total: 0,
+        page,
+        limit,
+        totalPages: 0,
+      },
+    };
+
+    if (userId) {
+      const profileUser = await this.prisma.user.findUnique({
+        where: { id: userId },
+        select: {
+          role: true,
+          latitude: true,
+          longitude: true,
+          contentAreaKm: true,
+          pickupAreaKm: true,
+          deliveryAreaKm: true,
+        },
+      });
+      if (!profileUser) {
+        throw new NotFoundException('User not found');
+      }
+      if (!canViewerSeeCreatorContent(viewerRoleNorm, profileUser.role)) {
+        return emptyResult;
+      }
+      // Direct profile posts: skip content-area distance gate (same as shorts/videos).
+      where.userId = userId;
+    }
+
     // Nearby: same as Video — filter by creator (user) location only
-    if (nearbyLat != null && nearbyLng != null) {
+    if (nearbyLat != null && nearbyLng != null && !userId) {
       const usersWithLocation = await this.prisma.user.findMany({
         where: {
           latitude: { not: null },
           longitude: { not: null },
         },
-        select: { id: true, latitude: true, longitude: true },
+        select: {
+          id: true,
+          role: true,
+          latitude: true,
+          longitude: true,
+          contentAreaKm: true,
+          pickupAreaKm: true,
+          deliveryAreaKm: true,
+        },
       });
       const nearbyUserIds = usersWithLocation
-        .filter(
-          (u) =>
-            u.latitude != null &&
-            u.longitude != null &&
-            this.haversineKm(nearbyLat, nearbyLng, u.latitude, u.longitude) <= radiusKm,
-        )
+        .filter((u) => {
+          if (u.latitude == null || u.longitude == null) return false;
+          if (!canViewerSeeCreatorContent(viewerRoleNorm, u.role)) {
+            return false;
+          }
+          const distanceKm = this.haversineKm(
+            nearbyLat,
+            nearbyLng,
+            u.latitude,
+            u.longitude,
+          );
+          const effectiveRadiusKm = effectiveNearbyRadiusKm(
+            viewerRoleNorm,
+            u,
+            radiusKm,
+          );
+          return distanceKm <= effectiveRadiusKm;
+        })
         .map((u) => u.id);
-      if (userId) {
-        where.userId = nearbyUserIds.includes(userId) ? userId : '';
-      } else {
-        where.userId = { in: nearbyUserIds.length > 0 ? nearbyUserIds : [''] };
-      }
-    } else if (userId) {
-      where.userId = userId;
+      where.userId = { in: nearbyUserIds.length > 0 ? nearbyUserIds : [''] };
     }
 
-    // Exclude vendor posts from feed only when viewer is 'user' and we're not loading a specific user's profile
-    const viewerRoleNorm = (viewerRole || 'user').toLowerCase();
-    if (viewerRoleNorm === 'user' && userId == null) {
-      where.user = { role: { not: 'vendor' } };
+    const roleFilter = creatorRoleWhereForViewer(viewerRoleNorm);
+    if (roleFilter && !userId) {
+      where.user = roleFilter;
     }
 
-    this.applyPublishedVisibility(where, {
-      profileUserId: userId ?? undefined,
-      viewerUserId: viewerUserId ?? undefined,
-    });
+    this.applyPublishedVisibility(where);
 
     const orderBy = { createdAt: 'desc' as const };
 
@@ -315,7 +369,7 @@ export class PostService {
     };
   }
 
-  async getPostById(id: string, userId?: string) {
+  async getPostById(id: string, userId?: string, viewerRole?: string) {
     const post = await this.prisma.post.findUnique({
       where: { id },
       include: {
@@ -350,6 +404,12 @@ export class PostService {
     ) {
       throw new NotFoundException('Post not found');
     }
+
+    assertViewerCanSeeCreatorContent(
+      viewerRole,
+      post.user?.role,
+      'Post not found',
+    );
 
     let isLiked = false;
     let isDisliked = false;
@@ -401,12 +461,26 @@ export class PostService {
     },
   ) {
     if (!files || files.length < 1) {
-      throw new BadRequestException('At least a thumbnail image is required');
+      throw new BadRequestException('At least a video or thumbnail image is required');
     }
-    const imageFile = files.find((f) => f.mimetype.startsWith('image/'));
+    let imageFile = files.find((f) => f.mimetype.startsWith('image/'));
     const videoFile = files.find((f) => f.mimetype.startsWith('video/'));
+    if (!imageFile && videoFile) {
+      try {
+        const thumbBuffer = await extractVideoThumbnailFromMulterFile(videoFile);
+        imageFile = multerFileFromBuffer(thumbBuffer);
+        this.logger.log('Auto-generated post thumbnail from uploaded video');
+      } catch (e: any) {
+        this.logger.warn(
+          `Post thumbnail auto-generation failed: ${e?.message || e}`,
+        );
+        throw new BadRequestException(
+          'Thumbnail is required or could not be generated from the video.',
+        );
+      }
+    }
     if (!imageFile) {
-      throw new BadRequestException('Thumbnail must be an image');
+      throw new BadRequestException('Thumbnail must be an image (or upload a video to auto-generate one)');
     }
     if (!body.userId || !body.title) {
       throw new BadRequestException('userId and title are required');
@@ -436,7 +510,7 @@ export class PostService {
       let mediaUrl = thumbnailUrl;
       let mediaType: 'image' | 'video' = 'image';
       let durationSec = duration ?? 0;
-      if (videoFile && files.length >= 2) {
+      if (videoFile) {
         const { url: videoUrl } = await this.r2Storage.uploadFile(
           videoFile,
           'videos',
@@ -861,6 +935,34 @@ export class PostService {
     return { disliked: true };
   }
 
+  async updateComment(dto: PostCommentUpdateDto) {
+    const { commentId, userId, content } = dto;
+    const trimmed = String(content || '').trim();
+    if (!trimmed) {
+      throw new BadRequestException('Comment content is required');
+    }
+    const comment = await this.prisma.postComment.findUnique({
+      where: { id: commentId },
+    });
+    if (!comment) throw new NotFoundException('Comment not found');
+    if (comment.userId !== userId) {
+      throw new BadRequestException('You can only edit your own comments');
+    }
+    return this.prisma.postComment.update({
+      where: { id: commentId },
+      data: { content: trimmed },
+      include: {
+        user: {
+          select: {
+            id: true,
+            name: true,
+            nickname: true,
+          },
+        },
+      },
+    });
+  }
+
   async deleteComment(dto: PostCommentDeleteDto) {
     const { commentId, userId } = dto;
     const comment = await this.prisma.postComment.findUnique({
@@ -883,6 +985,9 @@ export class PostService {
     page: number = 1,
     limit: number = 20,
     viewerUserId?: string,
+    viewerRole?: string,
+    viewerLat?: number,
+    viewerLng?: number,
   ) {
     return this.getPosts({
       userId,
@@ -890,6 +995,9 @@ export class PostService {
       limit,
       sort: 'latest',
       viewerUserId,
+      viewerRole,
+      viewerLat,
+      viewerLng,
     });
   }
 }

@@ -5,7 +5,9 @@ import {
   BadRequestException,
   UnauthorizedException,
   InternalServerErrorException,
+  ForbiddenException,
 } from '@nestjs/common';
+import { haversineKm, isValidCoord, resolveOwnerAreaKm } from '../common/geo.util';
 import { PrismaService } from '../prisma/prisma.service';
 import { CreateUserDto } from './dto/create-user.dto';
 import { LoginUserDto } from './dto/login-user.dto';
@@ -13,12 +15,14 @@ import * as bcrypt from 'bcrypt';
 import * as jwt from 'jsonwebtoken';
 import { ConfigService } from '@nestjs/config';
 import { Prisma, Product } from '@prisma/client';
+import { CreateRiderDto } from './dto/create-rider.dto';
 import { UpdateUserDto } from './dto/update-user.dto';
 import { AuditLogService } from 'src/audit/audit.service';
 import {
   ForgotPasswordDto,
   VerifyOtpDto,
   ResetPasswordDto,
+  ReactivateAccountDto,
 } from './dto/forgot-password.dto';
 import {
   SetPinDto,
@@ -29,6 +33,20 @@ import {
 import { ChangePasswordDto } from './dto/change-password.dto';
 import { R2StorageService } from '../r2-storage/r2-storage.service';
 import * as nodemailer from 'nodemailer';
+import * as crypto from 'crypto';
+import { SocialLoginDto } from './dto/social-login.dto';
+import { PhoneLoginDto } from './dto/phone-login.dto';
+import {
+  normalizePhoneE164,
+  phoneToSyntheticEmail,
+  verifyFirebasePhoneIdToken,
+} from '../common/firebase-phone.util';
+import {
+  getJwtExpiresIn,
+  signUserAuthToken,
+  verifyAuthTokenIgnoreExpiry,
+} from '../common/jwt.util';
+import { verifyAppleIdentityToken } from '../common/apple-auth.util';
 
 @Injectable()
 export class UsersService {
@@ -39,66 +57,243 @@ export class UsersService {
     private readonly auditLogService: AuditLogService,
   ) {}
 
-  private async sendVerificationOtpEmail(email: string, otp: string) {
+  private signAuthToken(user: { id: string; email: string }): string {
+    return signUserAuthToken(
+      user,
+      this.configService.get<string>('JWT_SECRET'),
+      getJwtExpiresIn(this.configService),
+    );
+  }
+
+  private mapAppAuthUser(activeUser: any) {
+    return {
+      id: activeUser.id,
+      name: activeUser.name,
+      nickname: activeUser.nickname,
+      email: activeUser.email,
+      phone: activeUser.phone,
+      gender: activeUser.gender,
+      address: activeUser.address,
+      postcode: activeUser.postcode ?? undefined,
+      latitude: activeUser.latitude ?? undefined,
+      longitude: activeUser.longitude ?? undefined,
+      role: activeUser.role,
+      roleId: activeUser.roleId,
+      employeeId: activeUser.employeeId,
+      pin: activeUser.pin ? true : false,
+      photos: activeUser.photos ?? [],
+      channelAbout: activeUser.channelAbout ?? undefined,
+      socialLinks: activeUser.socialLinks ?? undefined,
+      savedLastLocation: (activeUser as any).savedLastLocation ?? undefined,
+      interests: activeUser.interests || [],
+      branch: activeUser.branch,
+      clientBusiness: activeUser.clientBusiness,
+      permissions: (activeUser.permissions || []).map((permission: any) => ({
+        id: permission.id,
+        name: permission.name,
+      })),
+    };
+  }
+
+  private async loadAuthUserById(userId: string) {
+    return this.prisma.user.findUnique({
+      where: { id: userId },
+      include: {
+        branch: true,
+        permissions: true,
+        roleModel: true,
+        clientBusiness: true,
+      },
+    });
+  }
+
+  async refreshSession(
+    authHeader?: string,
+  ): Promise<{ token: string; user: Partial<any> }> {
+    const raw = String(authHeader || '').trim();
+    const token = raw.replace(/^Bearer\s+/i, '').trim();
+    if (!token) {
+      throw new UnauthorizedException('No session token provided');
+    }
+
+    let payload: { userId?: string; email?: string };
     try {
-      const smtpUser =
-        this.configService.get<string>('GMAIL_USER') ||
-        this.configService.get<string>('SMTP_USER') ||
-        this.configService.get<string>('MAIL_USER') ||
-        this.configService.get<string>('EMAIL_USER');
-      const smtpPass =
-        this.configService.get<string>('GMAIL_APP_PASSWORD') ||
-        this.configService.get<string>('SMTP_PASS') ||
-        this.configService.get<string>('MAIL_PASS') ||
-        this.configService.get<string>('EMAIL_PASS');
-      const smtpHost = this.configService.get<string>('SMTP_HOST');
-      const smtpPort = Number(this.configService.get<string>('SMTP_PORT') || 0);
-      const smtpSecure =
-        String(this.configService.get<string>('SMTP_SECURE') || '').toLowerCase() ===
-        'true';
-      const mailFrom =
-        this.configService.get<string>('MAIL_FROM') ||
-        this.configService.get<string>('SMTP_FROM') ||
-        smtpUser;
+      payload = verifyAuthTokenIgnoreExpiry(
+        token,
+        this.configService.get<string>('JWT_SECRET'),
+      ) as { userId?: string; email?: string };
+    } catch {
+      throw new UnauthorizedException('Invalid session');
+    }
 
-      if (!smtpUser || !smtpPass) {
-        throw new BadRequestException(
-          'Email service is not configured. Set GMAIL_USER/GMAIL_APP_PASSWORD (or SMTP_USER/SMTP_PASS).',
-        );
-      }
+    const userId = payload.userId;
+    const email = payload.email;
+    if (!userId && !email) {
+      throw new UnauthorizedException('Invalid session payload');
+    }
 
-      const transporter =
-        smtpHost && smtpPort
-          ? nodemailer.createTransport({
-              host: smtpHost,
-              port: smtpPort,
-              secure: smtpSecure,
-              auth: {
-                user: smtpUser,
-                pass: smtpPass,
-              },
-            })
-          : nodemailer.createTransport({
-              service: 'gmail',
-              auth: {
-                user: smtpUser,
-                pass: smtpPass,
-              },
-            });
+    const user = userId
+      ? await this.loadAuthUserById(userId)
+      : await this.prisma.user.findUnique({
+          where: { email },
+          include: {
+            branch: true,
+            permissions: true,
+            roleModel: true,
+            clientBusiness: true,
+          },
+        });
 
+    if (!user) {
+      throw new UnauthorizedException('User not found');
+    }
+
+    const activeUser = await this.ensureAppUserCanLogin(user, {
+      branch: true,
+      permissions: true,
+      roleModel: true,
+      clientBusiness: true,
+    });
+
+    return {
+      token: this.signAuthToken(activeUser),
+      user: this.mapAppAuthUser(activeUser),
+    };
+  }
+
+  private normalizeEmail(email: string): string {
+    return String(email || '').trim().toLowerCase();
+  }
+
+  private async findUserByEmail(email: string) {
+    const normalizedEmail = this.normalizeEmail(email);
+    if (!normalizedEmail) return null;
+    return this.prisma.user.findFirst({
+      where: { email: { equals: normalizedEmail, mode: 'insensitive' } },
+    });
+  }
+
+  private createMailTransporter() {
+    const smtpUser =
+      this.configService.get<string>('GMAIL_USER') ||
+      this.configService.get<string>('SMTP_USER') ||
+      this.configService.get<string>('MAIL_USER') ||
+      this.configService.get<string>('EMAIL_USER');
+    const smtpPassRaw =
+      this.configService.get<string>('GMAIL_APP_PASSWORD') ||
+      this.configService.get<string>('SMTP_PASS') ||
+      this.configService.get<string>('MAIL_PASS') ||
+      this.configService.get<string>('EMAIL_PASS');
+    const smtpPass = String(smtpPassRaw || '').replace(/\s/g, '');
+    const smtpHost = this.configService.get<string>('SMTP_HOST');
+    const smtpPort = Number(this.configService.get<string>('SMTP_PORT') || 0);
+    const smtpSecure =
+      String(this.configService.get<string>('SMTP_SECURE') || '').toLowerCase() ===
+      'true';
+    const mailFrom =
+      this.configService.get<string>('MAIL_FROM') ||
+      this.configService.get<string>('SMTP_FROM') ||
+      smtpUser;
+
+    if (!smtpUser || !smtpPass) {
+      throw new BadRequestException(
+        'Email service is not configured. Set GMAIL_USER/GMAIL_APP_PASSWORD (or SMTP_USER/SMTP_PASS).',
+      );
+    }
+
+    const transporter =
+      smtpHost && smtpPort
+        ? nodemailer.createTransport({
+            host: smtpHost,
+            port: smtpPort,
+            secure: smtpSecure,
+            auth: { user: smtpUser, pass: smtpPass },
+          })
+        : nodemailer.createTransport({
+            service: 'gmail',
+            auth: { user: smtpUser, pass: smtpPass },
+          });
+
+    return { transporter, mailFrom };
+  }
+
+  private async sendOtpEmailMessage(
+    email: string,
+    otp: string,
+    subject: string,
+    introText: string,
+  ) {
+    try {
+      const { transporter, mailFrom } = this.createMailTransporter();
       await transporter.sendMail({
         from: mailFrom,
         to: email,
-        subject: 'Verify your email - OTP',
-        html: `<p>Your verification OTP is <b>${otp}</b>. It expires in 10 minutes.</p>`,
+        subject,
+        html: `<p>${introText}</p><p>Your OTP is <b>${otp}</b>. It expires in 10 minutes.</p>`,
       });
     } catch (error) {
-      console.error('Failed to send verification email:', error);
+      console.error('Failed to send OTP email:', error);
       if (error instanceof BadRequestException) {
         throw error;
       }
       throw new BadRequestException(
         'Failed to send OTP email. Check SMTP/Gmail credentials and app password.',
+      );
+    }
+  }
+
+  private async sendVerificationOtpEmail(email: string, otp: string) {
+    await this.sendOtpEmailMessage(
+      email,
+      otp,
+      'Verify your email - OTP',
+      'Your verification OTP is',
+    );
+  }
+
+  private static readonly PUBLIC_SIGNUP_ROLES = ['user', 'owner', 'vendor'];
+
+  /** Off by default. Set EMAIL_VERIFICATION_REQUIRED=true in env to require signup email OTP. */
+  private isEmailVerificationRequired(): boolean {
+    const raw = this.configService.get<string>('EMAIL_VERIFICATION_REQUIRED');
+    return String(raw || '').trim().toLowerCase() === 'true';
+  }
+
+  private normalizeRoleName(inputRole?: string): string {
+    const normalized = String(inputRole || '')
+      .trim()
+      .toLowerCase();
+    const roleAliases: Record<string, string> = {
+      user: 'user',
+      owner: 'owner',
+      vendor: 'vendor',
+      admin: 'admin',
+      superadmin: 'superAdmin',
+      manager: 'manager',
+      rider: 'rider',
+      schoolmanager: 'schoolManager',
+      b2bmanager: 'b2bManager',
+      franchise: 'franchise',
+      employee: 'employee',
+      client: 'client',
+    };
+
+    if (!normalized) return 'user';
+    return roleAliases[normalized] || String(inputRole || '').trim();
+  }
+
+  private validatePasswordStrength(password: string) {
+    if (!password || password.length < 8) {
+      throw new BadRequestException(
+        'Password must be at least 8 characters long',
+      );
+    }
+    const hasUpperCase = /[A-Z]/.test(password);
+    const hasLowerCase = /[a-z]/.test(password);
+    const hasNumber = /\d/.test(password);
+    if (!hasUpperCase || !hasLowerCase || !hasNumber) {
+      throw new BadRequestException(
+        'Password must include uppercase, lowercase, and number',
       );
     }
   }
@@ -164,17 +359,63 @@ export class UsersService {
       throw new BadRequestException('User with email already exists');
     }
 
-    let roleName = role || 'user';
+    let roleName = this.normalizeRoleName(role);
     let finalRoleId: string | undefined = roleId;
     if (roleId) {
       const roleRecord = await this.prisma.role.findUnique({
         where: { id: roleId },
       });
-      if (roleRecord) {
-        roleName = roleRecord.name;
+      if (!roleRecord) {
+        const roleIdAsName = String(roleId).toLowerCase();
+        if (UsersService.PUBLIC_SIGNUP_ROLES.includes(roleIdAsName)) {
+          roleName = this.normalizeRoleName(roleIdAsName);
+          finalRoleId = undefined;
+        } else {
+          throw new BadRequestException(
+            'Invalid role selected. Please refresh and try again.',
+          );
+        }
       } else {
-        finalRoleId = undefined;
+        roleName = this.normalizeRoleName(roleRecord.name);
+        finalRoleId = roleRecord.id;
       }
+    } else if (roleName) {
+      const roleRecordByName = await this.prisma.role.findFirst({
+        where: { name: { equals: roleName, mode: 'insensitive' } },
+      });
+      if (roleRecordByName) {
+        finalRoleId = roleRecordByName.id;
+        roleName = this.normalizeRoleName(roleRecordByName.name);
+      }
+    }
+
+    const isSimpleSignup =
+      !nationalId &&
+      !businessName &&
+      !departmentId &&
+      !branch &&
+      !tradeLicense;
+    if (
+      isSimpleSignup &&
+      !UsersService.PUBLIC_SIGNUP_ROLES.includes(
+        String(roleName || 'user').toLowerCase(),
+      )
+    ) {
+      throw new BadRequestException(
+        'Registration is only available for User, Owner, and Vendor accounts.',
+      );
+    }
+
+    if (
+      isSimpleSignup &&
+      UsersService.PUBLIC_SIGNUP_ROLES.includes(
+        String(roleName || 'user').toLowerCase(),
+      ) &&
+      createUserDto.termsAccepted !== true
+    ) {
+      throw new BadRequestException(
+        'You must accept the Terms of Use and Community Guidelines to register.',
+      );
     }
 
     // Auto-assign password for employees and franchises
@@ -191,21 +432,31 @@ export class UsersService {
 
     let hashedPassword: string | undefined;
     if (passwordToUse) {
+      this.validatePasswordStrength(passwordToUse);
       hashedPassword = await bcrypt.hash(passwordToUse, 10);
     }
 
-    // Require email verification for app-facing self-signup roles.
-    const requiresEmailVerification = ['user', 'owner', 'vendor'].includes(
-      String(roleName || '').toLowerCase(),
-    );
+    // App self-signup (user, owner, vendor) is active immediately so they can log in.
+    // Employee / franchise / client stay pending until admin approval.
+    const roleKey = String(roleName || 'user').toLowerCase();
 
-    // Set initial status to 'pending' for employee, franchise, and client
-    const initialStatus =
-      roleName === 'employee' ||
-      roleName === 'franchise' ||
-      roleName === 'client'
-        ? 'pending'
-        : requiresEmailVerification
+    // Require email verification for app self-signup when EMAIL_VERIFICATION_REQUIRED=true.
+    const requiresEmailVerification =
+      this.isEmailVerificationRequired() &&
+      isSimpleSignup &&
+      UsersService.PUBLIC_SIGNUP_ROLES.includes(roleKey);
+
+    let signupOtp: string | undefined;
+    let signupOtpExpiry: Date | undefined;
+    if (requiresEmailVerification) {
+      signupOtp = Math.floor(10000 + Math.random() * 90000).toString();
+      signupOtpExpiry = new Date(Date.now() + 10 * 60 * 1000);
+    }
+
+    const approvalPendingRoles = ['employee', 'franchise', 'client'];
+    const initialStatus = UsersService.PUBLIC_SIGNUP_ROLES.includes(roleKey)
+      ? 'active'
+      : approvalPendingRoles.includes(roleKey)
         ? 'pending'
         : 'active';
 
@@ -267,26 +518,24 @@ export class UsersService {
         },
         ...(requiresEmailVerification
           ? {
-              otp: Math.floor(10000 + Math.random() * 90000).toString(),
-              otpExpiry: new Date(Date.now() + 10 * 60 * 1000),
+              otp: signupOtp,
+              otpExpiry: signupOtpExpiry,
               otpVerified: false,
             }
-          : {}),
+          : initialStatus === 'active'
+            ? { otpVerified: true }
+            : { otpVerified: false }),
       },
       include: { permissions: true },
     });
 
-    if (requiresEmailVerification) {
-      await this.sendVerificationOtpEmail(email, String(user.otp || ''));
+    if (requiresEmailVerification && signupOtp) {
+      await this.sendVerificationOtpEmail(user.email, signupOtp);
     }
 
     const token = requiresEmailVerification
       ? undefined
-      : jwt.sign(
-          { userId: user.id, email: user.email },
-          this.configService.get('JWT_SECRET'),
-          { expiresIn: '1h' },
-        );
+      : this.signAuthToken(user);
 
     const userData = {
       id: user.id,
@@ -297,6 +546,7 @@ export class UsersService {
       gender: user.gender,
       address: user.address,
       role: user.role,
+      roleId: user.roleId,
       employeeId: user.employeeId,
       interests: user.interests || [],
       permissions: user.permissions.map((permission) => ({
@@ -312,10 +562,53 @@ export class UsersService {
     };
   }
 
+  /** App self-signup roles must verify email before login when otpVerified is false. */
+  private async ensureAppUserCanLogin<
+    T extends {
+      id: string;
+      status?: string | null;
+      role?: string | null;
+      otpVerified?: boolean | null;
+    },
+  >(user: T, include: Record<string, boolean> = {}) {
+    const role = String(user.role || '').toLowerCase();
+    const approvalPendingRoles = ['employee', 'franchise', 'client'];
+    if (user.status === 'blocked' || user.status === 'deactive') {
+      throw new UnauthorizedException(
+        'ACCOUNT_INACTIVE: Your account is blocked or deactivated. Use Forgot Password to recover your account.',
+      );
+    }
+    if (user.status === 'pending' && approvalPendingRoles.includes(role)) {
+      throw new UnauthorizedException(
+        'Your account is pending approval.',
+      );
+    }
+    if (
+      this.isEmailVerificationRequired() &&
+      UsersService.PUBLIC_SIGNUP_ROLES.includes(role) &&
+      user.otpVerified === false
+    ) {
+      throw new UnauthorizedException(
+        'EMAIL_NOT_VERIFIED: Please verify your email before logging in.',
+      );
+    }
+    if (user.status === 'pending') {
+      return this.prisma.user.update({
+        where: { id: user.id },
+        data: { status: 'active' as any, otpVerified: true },
+        include,
+      });
+    }
+    return user;
+  }
+
   async loginUser(
     loginUserDto: LoginUserDto,
   ): Promise<{ token: string; user: Partial<any> }> {
     const { email, password } = loginUserDto;
+    if (!email || !password) {
+      throw new BadRequestException('Email and password are required');
+    }
 
     const user = await this.prisma.user.findUnique({
       where: { email },
@@ -327,59 +620,52 @@ export class UsersService {
       },
     });
 
-    if (!user) {
-      throw new NotFoundException('User not found');
-    }
-
-    if (user.status === 'blocked' || user.status === 'deactive') {
-      throw new UnauthorizedException(
-        'User is blocked or deactivated and cannot log in',
-      );
-    }
-
-    if (user.status === 'pending') {
-      throw new UnauthorizedException(
-        'Your account is pending approval or email verification.',
-      );
+    if (!user || !user.password) {
+      throw new UnauthorizedException('Invalid email or password');
     }
 
     const passwordMatch = await bcrypt.compare(password, user.password);
     if (!passwordMatch) {
-      throw new UnauthorizedException('Invalid password');
+      throw new UnauthorizedException('Invalid email or password');
     }
 
+    const activeUser = await this.ensureAppUserCanLogin(user, {
+      branch: true,
+      permissions: true,
+      roleModel: true,
+      clientBusiness: true,
+    });
+
     const userData = {
-      id: user.id,
-      name: user.name,
-      nickname: user.nickname,
-      email: user.email,
-      phone: user.phone,
-      gender: user.gender,
-      address: user.address,
-      latitude: user.latitude ?? undefined,
-      longitude: user.longitude ?? undefined,
-      role: user.role,
-      roleId: user.roleId,
-      employeeId: user.employeeId,
-      pin: user.pin ? true : false, // Only return if PIN exists (not the actual value)
-      photos: user.photos ?? [],
-      channelAbout: user.channelAbout ?? undefined,
-      socialLinks: user.socialLinks ?? undefined,
-      savedLastLocation: (user as any).savedLastLocation ?? undefined,
-      interests: user.interests || [],
-      branch: user.branch,
-      clientBusiness: user.clientBusiness,
-      permissions: user.permissions.map((permission) => ({
+      id: activeUser.id,
+      name: activeUser.name,
+      nickname: activeUser.nickname,
+      email: activeUser.email,
+      phone: activeUser.phone,
+      gender: activeUser.gender,
+      address: activeUser.address,
+      postcode: activeUser.postcode ?? undefined,
+      latitude: activeUser.latitude ?? undefined,
+      longitude: activeUser.longitude ?? undefined,
+      role: activeUser.role,
+      roleId: activeUser.roleId,
+      employeeId: activeUser.employeeId,
+      pin: activeUser.pin ? true : false, // Only return if PIN exists (not the actual value)
+      photos: activeUser.photos ?? [],
+      channelAbout: activeUser.channelAbout ?? undefined,
+      socialLinks: activeUser.socialLinks ?? undefined,
+      savedLastLocation: (activeUser as any).savedLastLocation ?? undefined,
+      fingerprintEnabled: activeUser.fingerprintEnabled ?? false,
+      interests: activeUser.interests || [],
+      branch: activeUser.branch,
+      clientBusiness: activeUser.clientBusiness,
+      permissions: activeUser.permissions.map((permission) => ({
         id: permission.id,
         name: permission.name,
       })),
     };
 
-    const token = jwt.sign(
-      { userId: user.id, email: user.email },
-      this.configService.get('JWT_SECRET'),
-      { expiresIn: '1h' },
-    );
+    const token = this.signAuthToken(activeUser);
 
     return { token, user: userData };
   }
@@ -388,6 +674,9 @@ export class UsersService {
     loginUserDto: LoginUserDto,
   ): Promise<{ token: string; user: Partial<any> }> {
     const { email, password } = loginUserDto;
+    if (!email || !password) {
+      throw new BadRequestException('Email and password are required');
+    }
 
     const user = await this.prisma.user.findUnique({
       where: { email },
@@ -397,8 +686,8 @@ export class UsersService {
       },
     });
 
-    if (!user) {
-      throw new NotFoundException('User not found');
+    if (!user || !user.password) {
+      throw new UnauthorizedException('Invalid email or password');
     }
 
     if (user.status === 'blocked' || user.status === 'deactive') {
@@ -420,7 +709,7 @@ export class UsersService {
 
     const passwordMatch = await bcrypt.compare(password, user.password);
     if (!passwordMatch) {
-      throw new UnauthorizedException('Invalid password');
+      throw new UnauthorizedException('Invalid email or password');
     }
 
     const userData = {
@@ -438,13 +727,390 @@ export class UsersService {
       })),
     };
 
-    const token = jwt.sign(
-      { userId: user.id, email: user.email },
-      this.configService.get('JWT_SECRET'),
-      { expiresIn: '1h' },
-    );
+    const token = this.signAuthToken(user);
 
     return { token, user: userData };
+  }
+
+  /** Validates Google id_token and/or OAuth access_token via Google tokeninfo. */
+  private async verifyGoogleSocialProfile(
+    dto: SocialLoginDto,
+  ): Promise<Record<string, unknown>> {
+    const idToken = String(dto.idToken || '').trim();
+    const accessToken = String(dto.accessToken || '').trim();
+    const attempts: { query: string; label: string }[] = [];
+    if (idToken) {
+      attempts.push({
+        query: `id_token=${encodeURIComponent(idToken)}`,
+        label: 'id_token',
+      });
+    }
+    if (accessToken) {
+      attempts.push({
+        query: `access_token=${encodeURIComponent(accessToken)}`,
+        label: 'access_token',
+      });
+    }
+    if (!attempts.length) {
+      throw new BadRequestException(
+        'Google idToken or accessToken is required',
+      );
+    }
+
+    let lastDetail = 'Invalid Google token';
+    for (const attempt of attempts) {
+      const res = await fetch(
+        `https://oauth2.googleapis.com/tokeninfo?${attempt.query}`,
+      );
+      const bodyText = await res.text();
+      let profile: Record<string, unknown> = {};
+      try {
+        profile = bodyText ? JSON.parse(bodyText) : {};
+      } catch {
+        profile = {};
+      }
+      if (res.ok) {
+        const iss = String(profile.iss || '').trim();
+        if (
+          iss &&
+          iss !== 'https://accounts.google.com' &&
+          iss !== 'accounts.google.com'
+        ) {
+          throw new BadRequestException('Invalid Google token issuer');
+        }
+        return profile;
+      }
+      const googleErr =
+        String(profile.error_description || profile.error || '').trim() ||
+        bodyText.slice(0, 200) ||
+        'verification failed';
+      lastDetail = `Invalid Google token (${attempt.label}): ${googleErr}`;
+    }
+    throw new BadRequestException(lastDetail);
+  }
+
+  private async verifyAppleSocialProfile(
+    dto: SocialLoginDto,
+  ): Promise<{ sub: string; email: string; name: string }> {
+    const bundleId =
+      String(this.configService.get('APPLE_BUNDLE_ID') || 'com.eatwaze.app').trim();
+    const claims = await verifyAppleIdentityToken(
+      String(dto.idToken || ''),
+      bundleId,
+    );
+    const providerId = String(claims.sub || '').trim();
+    const tokenEmail = String(claims.email || '').toLowerCase().trim();
+    const clientEmail = String(dto.email || '').toLowerCase().trim();
+    const email = tokenEmail || clientEmail;
+    const name = String(dto.name || '').trim();
+    return { sub: providerId, email, name };
+  }
+
+  async socialLogin(
+    dto: SocialLoginDto,
+  ): Promise<{ token: string; user: Partial<any> }> {
+    const provider = String(dto.provider || '').toLowerCase();
+    let providerId = '';
+    let email = '';
+    let name = '';
+
+    if (provider === 'google') {
+      const profile = await this.verifyGoogleSocialProfile(dto);
+      providerId = String(profile.sub || '');
+      email = String(profile.email || '').toLowerCase().trim();
+      name = String(profile.name || '').trim();
+      if (!providerId) {
+        throw new BadRequestException('Google profile is incomplete');
+      }
+      if (!email) {
+        email = `google_${providerId}@google.eatix.app`;
+      }
+    } else if (provider === 'facebook') {
+      if (!dto.accessToken) {
+        throw new BadRequestException('Facebook accessToken is required');
+      }
+      const res = await fetch(
+        `https://graph.facebook.com/me?fields=id,name,email&access_token=${encodeURIComponent(
+          dto.accessToken,
+        )}`,
+      );
+      if (!res.ok) {
+        throw new BadRequestException('Invalid Facebook token');
+      }
+      const profile = (await res.json()) as any;
+      providerId = String(profile.id || '');
+      email = String(profile.email || '').toLowerCase().trim();
+      name = String(profile.name || '').trim();
+      if (!providerId) {
+        throw new BadRequestException('Facebook profile is incomplete');
+      }
+      if (!email) {
+        email = `fb_${providerId}@facebook.eatix.app`;
+      }
+    } else if (provider === 'apple') {
+      if (!dto.idToken) {
+        throw new BadRequestException('Apple identity token is required');
+      }
+      try {
+        const profile = await this.verifyAppleSocialProfile(dto);
+        providerId = profile.sub;
+        email = profile.email;
+        name = profile.name;
+      } catch (err) {
+        const detail = String((err as Error)?.message || err || '').trim();
+        throw new BadRequestException(
+          detail.startsWith('Invalid Apple') || detail.includes('Apple')
+            ? detail
+            : `Invalid Apple token: ${detail || 'verification failed'}`,
+        );
+      }
+      if (!providerId) {
+        throw new BadRequestException('Apple profile is incomplete');
+      }
+      if (!email) {
+        email = `apple_${providerId}@apple.eatix.app`;
+      }
+    } else {
+      throw new BadRequestException('Unsupported social provider');
+    }
+
+    let user = await this.prisma.user.findFirst({
+      where: {
+        OR: [
+          { provider, providerId },
+          { email },
+        ],
+      },
+      include: {
+        branch: true,
+        permissions: true,
+        roleModel: true,
+        clientBusiness: true,
+      },
+    });
+
+    if (!user) {
+      if (dto.termsAccepted !== true) {
+        throw new BadRequestException(
+          'You must accept the Terms of Use and Community Guidelines to continue.',
+        );
+      }
+      user = await this.prisma.user.create({
+        data: {
+          email,
+          name: name || email.split('@')[0],
+          role: 'user',
+          status: 'active',
+          provider,
+          providerId,
+          otpVerified: true,
+          termsAccepted: dto.termsAccepted === true,
+          policyAccepted: dto.termsAccepted === true,
+        },
+        include: {
+          branch: true,
+          permissions: true,
+          roleModel: true,
+          clientBusiness: true,
+        },
+      });
+    } else if (user.provider !== provider || user.providerId !== providerId) {
+      user = await this.prisma.user.update({
+        where: { id: user.id },
+        data: {
+          provider,
+          providerId,
+          ...(name && !user.name ? { name } : {}),
+          ...(dto.termsAccepted === true
+            ? { termsAccepted: true, policyAccepted: true }
+            : {}),
+          ...(String(user.status || '').toLowerCase() !== 'active'
+            ? { status: 'active' as any }
+            : {}),
+        },
+        include: {
+          branch: true,
+          permissions: true,
+          roleModel: true,
+          clientBusiness: true,
+        },
+      });
+    }
+
+    const activeUser = await this.ensureAppUserCanLogin(user, {
+      branch: true,
+      permissions: true,
+      roleModel: true,
+      clientBusiness: true,
+    });
+
+    const token = this.signAuthToken(activeUser);
+
+    const userData = {
+      id: activeUser.id,
+      name: activeUser.name,
+      nickname: activeUser.nickname,
+      email: activeUser.email,
+      phone: activeUser.phone,
+      gender: activeUser.gender,
+      address: activeUser.address,
+      postcode: activeUser.postcode ?? undefined,
+      latitude: activeUser.latitude ?? undefined,
+      longitude: activeUser.longitude ?? undefined,
+      role: activeUser.role,
+      roleId: activeUser.roleId,
+      employeeId: activeUser.employeeId,
+      pin: activeUser.pin ? true : false,
+      photos: activeUser.photos ?? [],
+      channelAbout: activeUser.channelAbout ?? undefined,
+      socialLinks: activeUser.socialLinks ?? undefined,
+      savedLastLocation: (activeUser as any).savedLastLocation ?? undefined,
+      interests: activeUser.interests || [],
+      branch: activeUser.branch,
+      clientBusiness: activeUser.clientBusiness,
+      permissions: activeUser.permissions.map((permission) => ({
+        id: permission.id,
+        name: permission.name,
+      })),
+    };
+
+    return { token, user: userData };
+  }
+
+  private isProfileComplete(user: {
+    name?: string | null;
+    phone?: string | null;
+  }): boolean {
+    const name = String(user?.name || '').trim();
+    const phone = String(user?.phone || '').trim();
+    return name.length >= 2 && phone.length >= 8;
+  }
+
+  async phoneLogin(
+    dto: PhoneLoginDto,
+  ): Promise<{ token: string; user: Partial<any>; profileComplete: boolean }> {
+    const apiKey =
+      this.configService.get<string>('FIREBASE_WEB_API_KEY') || '';
+    const verified = await verifyFirebasePhoneIdToken(dto.idToken, apiKey);
+    const phone = normalizePhoneE164(dto.phone || verified.phone);
+    const verifiedPhone = normalizePhoneE164(verified.phone);
+    if (verifiedPhone !== phone) {
+      throw new BadRequestException('Phone number does not match verification');
+    }
+
+    const provider = 'firebase-phone';
+    const providerId = verified.uid;
+    const syntheticEmail = phoneToSyntheticEmail(phone);
+
+    let user = await this.prisma.user.findFirst({
+      where: {
+        OR: [
+          { phone },
+          { provider, providerId },
+          { email: syntheticEmail },
+        ],
+      },
+      include: {
+        branch: true,
+        permissions: true,
+        roleModel: true,
+        clientBusiness: true,
+      },
+    });
+
+    if (!user) {
+      if (dto.termsAccepted !== true) {
+        throw new BadRequestException(
+          'You must accept the Terms of Use and Community Guidelines to continue.',
+        );
+      }
+      user = await this.prisma.user.create({
+        data: {
+          email: syntheticEmail,
+          phone,
+          name: `User ${phone.slice(-4)}`,
+          role: 'user',
+          status: 'active',
+          provider,
+          providerId,
+          otpVerified: true,
+          phoneVerified: true,
+          profileComplete: false,
+          termsAccepted: true,
+          policyAccepted: true,
+        },
+        include: {
+          branch: true,
+          permissions: true,
+          roleModel: true,
+          clientBusiness: true,
+        },
+      });
+    } else {
+      const profileComplete = this.isProfileComplete(user);
+      user = await this.prisma.user.update({
+        where: { id: user.id },
+        data: {
+          phone,
+          phoneVerified: true,
+          provider,
+          providerId,
+          otpVerified: true,
+          ...(profileComplete ? { profileComplete: true } : {}),
+          ...(String(user.status || '').toLowerCase() !== 'active'
+            ? { status: 'active' as any }
+            : {}),
+        },
+        include: {
+          branch: true,
+          permissions: true,
+          roleModel: true,
+          clientBusiness: true,
+        },
+      });
+    }
+
+    const activeUser = await this.ensureAppUserCanLogin(user, {
+      branch: true,
+      permissions: true,
+      roleModel: true,
+      clientBusiness: true,
+    });
+
+    const profileComplete = this.isProfileComplete(activeUser);
+    const token = this.signAuthToken(activeUser);
+
+    const userData = {
+      id: activeUser.id,
+      name: activeUser.name,
+      nickname: activeUser.nickname,
+      email: activeUser.email,
+      phone: activeUser.phone,
+      gender: activeUser.gender,
+      address: activeUser.address,
+      postcode: activeUser.postcode ?? undefined,
+      latitude: activeUser.latitude ?? undefined,
+      longitude: activeUser.longitude ?? undefined,
+      role: activeUser.role,
+      roleId: activeUser.roleId,
+      employeeId: activeUser.employeeId,
+      pin: activeUser.pin ? true : false,
+      fingerprintEnabled: activeUser.fingerprintEnabled ?? false,
+      profileComplete,
+      photos: activeUser.photos ?? [],
+      channelAbout: activeUser.channelAbout ?? undefined,
+      socialLinks: activeUser.socialLinks ?? undefined,
+      savedLastLocation: (activeUser as any).savedLastLocation ?? undefined,
+      interests: activeUser.interests || [],
+      branch: activeUser.branch,
+      clientBusiness: activeUser.clientBusiness,
+      permissions: activeUser.permissions.map((permission) => ({
+        id: permission.id,
+        name: permission.name,
+      })),
+    };
+
+    return { token, user: userData, profileComplete };
   }
 
   async updatePassword(updatePasswordDto: any): Promise<{ message: string }> {
@@ -500,6 +1166,86 @@ export class UsersService {
   async deleteUser(id: string): Promise<string> {
     await this.prisma.user.delete({ where: { id } });
     return 'Deleted successfully';
+  }
+
+  async deleteOwnAccount(userId: string): Promise<{ message: string }> {
+    const id = String(userId || '').trim();
+    if (!id) {
+      throw new BadRequestException('Unauthorized');
+    }
+    const user = await this.prisma.user.findUnique({ where: { id } });
+    if (!user) {
+      throw new NotFoundException('User not found');
+    }
+    if (String(user.role || '').toLowerCase() === 'admin') {
+      throw new BadRequestException('Admin accounts cannot be deleted from the app');
+    }
+    try {
+      await this.prisma.user.delete({ where: { id } });
+    } catch (err) {
+      const detail = String((err as Error)?.message || err || '');
+      throw new BadRequestException(
+        `Could not delete account: ${detail || 'please contact support'}`,
+      );
+    }
+    return { message: 'Account deleted permanently' };
+  }
+
+  async blockUser(
+    blockerId: string,
+    blockedUserId: string,
+    reason?: string,
+  ): Promise<{ message: string }> {
+    const blocker = String(blockerId || '').trim();
+    const blocked = String(blockedUserId || '').trim();
+    if (!blocker || !blocked) {
+      throw new BadRequestException('blockedUserId is required');
+    }
+    if (blocker === blocked) {
+      throw new BadRequestException('You cannot block yourself');
+    }
+    const target = await this.prisma.user.findUnique({ where: { id: blocked } });
+    if (!target) {
+      throw new NotFoundException('User not found');
+    }
+    await this.prisma.userBlock.upsert({
+      where: {
+        blockerId_blockedUserId: { blockerId: blocker, blockedUserId: blocked },
+      },
+      create: {
+        blockerId: blocker,
+        blockedUserId: blocked,
+        reason: reason?.trim() || null,
+      },
+      update: {
+        reason: reason?.trim() || null,
+      },
+    });
+    return {
+      message:
+        'User blocked. Their content is hidden from your feed and the developer has been notified.',
+    };
+  }
+
+  async unblockUser(
+    blockerId: string,
+    blockedUserId: string,
+  ): Promise<{ message: string }> {
+    await this.prisma.userBlock.deleteMany({
+      where: {
+        blockerId: String(blockerId || '').trim(),
+        blockedUserId: String(blockedUserId || '').trim(),
+      },
+    });
+    return { message: 'User unblocked' };
+  }
+
+  async getBlockedUserIds(blockerId: string): Promise<{ ids: string[] }> {
+    const rows = await this.prisma.userBlock.findMany({
+      where: { blockerId: String(blockerId || '').trim() },
+      select: { blockedUserId: true },
+    });
+    return { ids: rows.map(r => r.blockedUserId) };
   }
 
   async getUsers(
@@ -588,7 +1334,7 @@ export class UsersService {
     const user = await this.prisma.user.findUnique({ where: { email } });
     if (user) {
       const token = jwt.sign({ email }, this.configService.get('JWT_SECRET'), {
-        expiresIn: '1h',
+        expiresIn: getJwtExpiresIn(this.configService),
       });
       return { accessToken: token };
     }
@@ -598,14 +1344,25 @@ export class UsersService {
   async getChannelsList(limit = 20): Promise<{ channels: any[] }> {
     const videoUserIds = await this.prisma.video
       .findMany({
-        where: { status: { not: 'deleted' }, visibility: 'public' },
+        where: {
+          status: { not: 'deleted' },
+          visibility: 'public',
+          OR: [
+            { scheduledPublishAt: null },
+            { scheduledPublishAt: { lte: new Date() } },
+          ],
+        },
         select: { userId: true },
         distinct: ['userId'],
       })
       .then((rows) => rows.map((r) => r.userId));
     const shortUserIds = await this.prisma.short
       .findMany({
-        where: { status: { not: 'deleted' }, visibility: 'public' },
+        where: {
+          status: { not: 'deleted' },
+          visibility: 'public',
+          OR: [{ publishedAt: null }, { publishedAt: { lte: new Date() } }],
+        },
         select: { userId: true },
         distinct: ['userId'],
       })
@@ -691,6 +1448,7 @@ export class UsersService {
           userId: { in: channelIds },
           status: { not: 'deleted' },
           visibility: 'public',
+          OR: [{ publishedAt: null }, { publishedAt: { lte: new Date() } }],
         },
         skip: 0,
         take: half,
@@ -734,10 +1492,20 @@ export class UsersService {
         photos: true,
         createdAt: true,
         address: true,
+        postcode: true,
         latitude: true,
         longitude: true,
         socialLinks: true,
         openingHours: true,
+        deliveryTime: true,
+        contentAreaKm: true,
+        pickupAreaKm: true,
+        deliveryAreaKm: true,
+        taxCharge0To10Km: true,
+        taxCharge11To20Km: true,
+        taxCharge21To30Km: true,
+        vendorMinOrderQty: true,
+        vendorMaxOrderQty: true,
         role: true,
       },
     });
@@ -771,6 +1539,7 @@ export class UsersService {
           userId,
           status: { not: 'deleted' },
           visibility: 'public',
+          OR: [{ publishedAt: null }, { publishedAt: { lte: new Date() } }],
         },
       }),
       this.prisma.video.aggregate({
@@ -784,6 +1553,7 @@ export class UsersService {
         where: {
           userId,
           status: { not: 'deleted' },
+          OR: [{ publishedAt: null }, { publishedAt: { lte: new Date() } }],
         },
         _sum: { viewCount: true },
       }),
@@ -820,10 +1590,16 @@ export class UsersService {
 
     const channelName = user.nickname || user.name || 'Unknown';
     const firstPhoto = Array.isArray(user.photos) ? user.photos[0] : null;
-    const rawSrc =
-      firstPhoto && typeof firstPhoto === 'object' && 'src' in firstPhoto
-        ? firstPhoto.src
-        : null;
+    let rawSrc: string | null = null;
+    if (typeof firstPhoto === 'string' && firstPhoto.trim()) {
+      rawSrc = firstPhoto.trim();
+    } else if (firstPhoto && typeof firstPhoto === 'object') {
+      const s =
+        (firstPhoto as { src?: string; uri?: string; url?: string }).src ??
+        (firstPhoto as { uri?: string }).uri ??
+        (firstPhoto as { url?: string }).url;
+      if (typeof s === 'string' && s.trim()) rawSrc = s.trim();
+    }
     // Ensure channelAvatar is always a string (Image uri cannot be boolean)
     const channelAvatar =
       typeof rawSrc === 'string' && rawSrc.trim().length > 0
@@ -845,10 +1621,20 @@ export class UsersService {
       coverImage: user.coverUrl ?? undefined,
       createdAt: user.createdAt,
       address: user.address ?? undefined,
+      postcode: user.postcode ?? undefined,
       latitude: user.latitude ?? undefined,
       longitude: user.longitude ?? undefined,
       socialLinks: user.socialLinks ?? undefined,
       openingHours: user.openingHours ?? undefined,
+      deliveryTime: user.deliveryTime ?? undefined,
+      contentAreaKm: user.contentAreaKm ?? undefined,
+      pickupAreaKm: user.pickupAreaKm ?? undefined,
+      deliveryAreaKm: user.deliveryAreaKm ?? undefined,
+      taxCharge0To10Km: user.taxCharge0To10Km ?? undefined,
+      taxCharge11To20Km: user.taxCharge11To20Km ?? undefined,
+      taxCharge21To30Km: user.taxCharge21To30Km ?? undefined,
+      vendorMinOrderQty: user.vendorMinOrderQty ?? undefined,
+      vendorMaxOrderQty: user.vendorMaxOrderQty ?? undefined,
       role: user.role ?? 'user',
       videoCount,
       shortCount,
@@ -1040,6 +1826,384 @@ export class UsersService {
     };
   }
 
+  /**
+   * Logged-in customers whose saved location falls within the owner's delivery radius.
+   * Owner-only (must request their own channel id).
+   */
+  async getDeliveryAreaUsers(
+    ownerId: string,
+    requestUserId: string,
+    page = 1,
+    limit = 50,
+  ): Promise<{
+    items: Array<{
+      id: string;
+      name: string;
+      nickname: string | null;
+      email: string;
+      phone: string | null;
+      address: string | null;
+      postcode: string | null;
+      distanceKm: number;
+      avatar: string | null;
+    }>;
+    total: number;
+    page: number;
+    limit: number;
+    radiusKm: number | null;
+    ownerAddress: string | null;
+    message?: string;
+  }> {
+    if (requestUserId !== ownerId) {
+      throw new ForbiddenException(
+        'Only the restaurant owner can view delivery area users',
+      );
+    }
+
+    const owner = await this.prisma.user.findUnique({
+      where: { id: ownerId },
+      select: {
+        id: true,
+        role: true,
+        latitude: true,
+        longitude: true,
+        contentAreaKm: true,
+        pickupAreaKm: true,
+        deliveryAreaKm: true,
+        address: true,
+      },
+    });
+    if (!owner) throw new NotFoundException('User not found');
+
+    const ownerRole = String(owner.role || '').toLowerCase();
+    if (ownerRole !== 'owner' && ownerRole !== 'vendor') {
+      throw new BadRequestException(
+        'Delivery area users are only available for restaurant owners',
+      );
+    }
+
+    const radiusKm = resolveOwnerAreaKm(owner, 'content');
+
+    const safePage = Math.max(1, Number(page) || 1);
+    const safeLimit = Math.min(100, Math.max(1, Number(limit) || 50));
+
+    if (radiusKm == null) {
+      return {
+        items: [],
+        total: 0,
+        page: safePage,
+        limit: safeLimit,
+        radiusKm: null,
+        ownerAddress: owner.address ?? null,
+        message:
+          'Set your content/browse area (km) in Settings so we can list nearby customers.',
+      };
+    }
+
+    if (!isValidCoord(owner.latitude) || !isValidCoord(owner.longitude)) {
+      return {
+        items: [],
+        total: 0,
+        page: safePage,
+        limit: safeLimit,
+        radiusKm,
+        ownerAddress: owner.address ?? null,
+        message:
+          'Set your shop location on the map in Edit Profile to see users in your content area.',
+      };
+    }
+
+    const candidates = await this.prisma.user.findMany({
+      where: {
+        id: { not: ownerId },
+        role: 'user',
+        status: 'active',
+        OR: [
+          { latitude: { not: null }, longitude: { not: null } },
+          { savedLastLocation: { not: null } },
+        ],
+      },
+      select: {
+        id: true,
+        name: true,
+        nickname: true,
+        email: true,
+        phone: true,
+        address: true,
+        postcode: true,
+        latitude: true,
+        longitude: true,
+        savedLastLocation: true,
+        photos: true,
+      },
+    });
+
+    const matched = candidates
+      .map((u) => {
+        let lat = u.latitude;
+        let lng = u.longitude;
+        const saved = u.savedLastLocation as
+          | { lat?: number; lng?: number; addressText?: string; postcode?: string; areaLabel?: string }
+          | null;
+        if (!isValidCoord(lat) || !isValidCoord(lng)) {
+          lat = saved?.lat ?? null;
+          lng = saved?.lng ?? null;
+        }
+        if (!isValidCoord(lat) || !isValidCoord(lng)) return null;
+
+        const distanceKm = haversineKm(
+          owner.latitude!,
+          owner.longitude!,
+          lat!,
+          lng!,
+        );
+        if (distanceKm > radiusKm) return null;
+
+        const displayName =
+          (u.nickname && String(u.nickname).trim()) ||
+          (u.name && String(u.name).trim()) ||
+          u.email;
+        const addressText =
+          (u.address && String(u.address).trim()) ||
+          (saved?.addressText && String(saved.addressText).trim()) ||
+          (saved?.areaLabel && String(saved.areaLabel).trim()) ||
+          null;
+        const postcode =
+          (u.postcode && String(u.postcode).trim()) ||
+          (saved?.postcode && String(saved.postcode).trim()) ||
+          null;
+        const firstPhoto = Array.isArray(u.photos) ? u.photos[0] : null;
+        const rawSrc =
+          firstPhoto && typeof firstPhoto === 'object' && 'src' in firstPhoto
+            ? (firstPhoto as { src?: string }).src
+            : null;
+        const avatar =
+          typeof rawSrc === 'string' && rawSrc.trim().length > 0
+            ? rawSrc.trim()
+            : null;
+
+        return {
+          id: u.id,
+          name: displayName,
+          nickname: u.nickname ?? null,
+          email: u.email,
+          phone: u.phone ?? null,
+          address: addressText,
+          postcode,
+          distanceKm: Math.round(distanceKm * 10) / 10,
+          avatar,
+        };
+      })
+      .filter((x): x is NonNullable<typeof x> => x != null)
+      .sort((a, b) => a.distanceKm - b.distanceKm);
+
+    const total = matched.length;
+    const skip = (safePage - 1) * safeLimit;
+    const items = matched.slice(skip, skip + safeLimit);
+
+    return {
+      items,
+      total,
+      page: safePage,
+      limit: safeLimit,
+      radiusKm,
+      ownerAddress: owner.address ?? null,
+    };
+  }
+
+  /** Restaurant owner creates a rider account linked to their restaurant. */
+  async createOwnerRider(
+    ownerId: string,
+    requestUserId: string,
+    dto: CreateRiderDto,
+  ) {
+    if (requestUserId !== ownerId) {
+      throw new ForbiddenException('Only the restaurant owner can create riders');
+    }
+    const owner = await this.prisma.user.findUnique({
+      where: { id: ownerId },
+      select: { id: true, role: true },
+    });
+    if (!owner) throw new NotFoundException('Owner not found');
+    const ownerRole = String(owner.role || '').toLowerCase();
+    if (ownerRole !== 'owner' && ownerRole !== 'vendor') {
+      throw new BadRequestException('Only restaurant owners can create riders');
+    }
+
+    const email = String(dto.email || '').trim().toLowerCase();
+    const existing = await this.prisma.user.findUnique({ where: { email } });
+    if (existing) {
+      throw new BadRequestException('User with this email already exists');
+    }
+    this.validatePasswordStrength(dto.password);
+    const hashedPassword = await bcrypt.hash(dto.password, 10);
+
+    const rider = await this.prisma.user.create({
+      data: {
+        email,
+        password: hashedPassword,
+        name: dto.name?.trim() || undefined,
+        phone: dto.phone?.trim() || undefined,
+        address: dto.address?.trim() || undefined,
+        role: 'rider',
+        employerId: ownerId,
+        status: 'active',
+      },
+      select: {
+        id: true,
+        name: true,
+        nickname: true,
+        email: true,
+        phone: true,
+        address: true,
+        photos: true,
+        role: true,
+        createdAt: true,
+      },
+    });
+
+    return { rider };
+  }
+
+  async listOwnerRiders(ownerId: string, requestUserId: string) {
+    if (requestUserId !== ownerId) {
+      throw new ForbiddenException('Only the restaurant owner can list riders');
+    }
+    const riders = await this.prisma.user.findMany({
+      where: { employerId: ownerId, role: 'rider' },
+      select: {
+        id: true,
+        name: true,
+        nickname: true,
+        email: true,
+        phone: true,
+        address: true,
+        photos: true,
+        status: true,
+        createdAt: true,
+      },
+      orderBy: { createdAt: 'desc' },
+    });
+
+    const riderIds = riders.map((r) => r.id);
+    const orderCounts =
+      riderIds.length === 0
+        ? []
+        : await this.prisma.restaurantOrder.groupBy({
+            by: ['riderId', 'status'],
+            where: { riderId: { in: riderIds } },
+            _count: { _all: true },
+          });
+
+    const countMap = new Map<string, { active: number; completed: number }>();
+    for (const row of orderCounts) {
+      if (!row.riderId) continue;
+      const cur = countMap.get(row.riderId) || { active: 0, completed: 0 };
+      if (row.status === 'completed') cur.completed += row._count._all;
+      else if (row.status !== 'cancelled') cur.active += row._count._all;
+      countMap.set(row.riderId, cur);
+    }
+
+    return {
+      riders: riders.map((r) => {
+        const p0 = Array.isArray(r.photos) ? (r.photos[0] as any) : null;
+        const counts = countMap.get(r.id) || { active: 0, completed: 0 };
+        return {
+          id: r.id,
+          name: r.nickname || r.name || r.email,
+          nickname: r.nickname,
+          email: r.email,
+          phone: r.phone,
+          address: r.address,
+          status: r.status,
+          createdAt: r.createdAt,
+          avatar: p0?.src ?? p0 ?? null,
+          activeOrders: counts.active,
+          completedOrders: counts.completed,
+        };
+      }),
+    };
+  }
+
+  async uploadOwnerRiderAvatar(
+    ownerId: string,
+    riderId: string,
+    requestUserId: string,
+    file: Express.Multer.File,
+  ) {
+    if (requestUserId !== ownerId) {
+      throw new ForbiddenException('Only the restaurant owner can upload rider photos');
+    }
+    const rider = await this.prisma.user.findFirst({
+      where: { id: riderId, employerId: ownerId, role: 'rider' },
+      select: { id: true },
+    });
+    if (!rider) throw new NotFoundException('Rider not found');
+    if (!file || !file.buffer) {
+      throw new BadRequestException('Profile image file is required');
+    }
+    const { url } = await this.r2Storage.uploadFile(file, 'avatars');
+    const photos = [{ title: 'avatar', src: url }];
+    const userUpdate = await this.prisma.user.update({
+      where: { id: riderId },
+      data: { photos: photos as any },
+    });
+    return { message: 'Rider avatar updated', userUpdate, photoUrl: url };
+  }
+
+  async getOwnerRiderProfile(
+    ownerId: string,
+    riderId: string,
+    requestUserId: string,
+  ) {
+    if (requestUserId !== ownerId) {
+      throw new ForbiddenException('Only the restaurant owner can view rider details');
+    }
+    const rider = await this.prisma.user.findFirst({
+      where: { id: riderId, employerId: ownerId, role: 'rider' },
+      select: {
+        id: true,
+        name: true,
+        nickname: true,
+        email: true,
+        phone: true,
+        address: true,
+        photos: true,
+        status: true,
+        createdAt: true,
+      },
+    });
+    if (!rider) throw new NotFoundException('Rider not found');
+
+    const orders = await this.prisma.restaurantOrder.findMany({
+      where: { riderId },
+      orderBy: { createdAt: 'desc' },
+      take: 100,
+      include: {
+        items: true,
+        user: {
+          select: { id: true, name: true, email: true, phone: true, photos: true },
+        },
+      },
+    });
+
+    const p0 = Array.isArray(rider.photos) ? (rider.photos[0] as any) : null;
+    return {
+      rider: {
+        id: rider.id,
+        name: rider.nickname || rider.name || rider.email,
+        nickname: rider.nickname,
+        email: rider.email,
+        phone: rider.phone,
+        address: rider.address,
+        status: rider.status,
+        createdAt: rider.createdAt,
+        avatar: p0?.src ?? p0 ?? null,
+      },
+      orders,
+    };
+  }
+
   async getChannelFollowing(
     userId: string,
     currentUserId?: string,
@@ -1224,6 +2388,7 @@ export class UsersService {
       address,
       latitude,
       longitude,
+      postcode,
       phone,
       gender,
       status,
@@ -1244,6 +2409,7 @@ export class UsersService {
     if (address !== undefined) updateData.address = address;
     if (latitude !== undefined) updateData.latitude = latitude;
     if (longitude !== undefined) updateData.longitude = longitude;
+    if (postcode !== undefined) updateData.postcode = postcode;
     if (phone !== undefined) updateData.phone = phone;
     if (gender !== undefined) updateData.gender = gender;
     if (status !== undefined) updateData.status = status;
@@ -1287,6 +2453,12 @@ export class UsersService {
       };
     }
 
+    const mergedName = name !== undefined ? name : oldUser.name;
+    const mergedPhone = phone !== undefined ? phone : oldUser.phone;
+    if (this.isProfileComplete({ name: mergedName, phone: mergedPhone })) {
+      updateData.profileComplete = true;
+    }
+
     const userUpdate = await this.prisma.user.update({
       where: { id },
       data: updateData,
@@ -1298,9 +2470,9 @@ export class UsersService {
 
   async updateSavedLastLocation(
     userId: string,
-    payload: { lat: number; lng: number; addressText?: string },
+    payload: { lat: number; lng: number; addressText?: string; postcode?: string; areaLabel?: string },
   ) {
-    const { lat, lng, addressText } = payload;
+    const { lat, lng, addressText, postcode, areaLabel } = payload;
     if (
       lat == null ||
       lng == null ||
@@ -1313,6 +2485,8 @@ export class UsersService {
       lat: Number(lat),
       lng: Number(lng),
       addressText: addressText ?? '',
+      postcode: postcode ?? '',
+      areaLabel: areaLabel ?? '',
       savedAt: Date.now(),
     };
     await this.prisma.user.update({
@@ -1742,30 +2916,38 @@ export class UsersService {
     forgotPasswordDto: ForgotPasswordDto,
   ): Promise<{ message: string; otpExpiry: Date }> {
     const { email, method } = forgotPasswordDto;
+    const normalizedEmail = this.normalizeEmail(email);
 
-    const user = await this.prisma.user.findUnique({ where: { email } });
+    const user = await this.findUserByEmail(normalizedEmail);
     if (!user) {
       throw new NotFoundException('User not found');
     }
 
-    // Generate 5-digit OTP
+    const deliveryMethod = method || 'email';
+    if (deliveryMethod === 'sms') {
+      throw new BadRequestException(
+        'SMS OTP is not configured yet. Please use email recovery.',
+      );
+    }
+
     const otp = Math.floor(10000 + Math.random() * 90000).toString();
-    const otpExpiry = new Date(Date.now() + 10 * 60 * 1000); // 10 minutes
+    const otpExpiry = new Date(Date.now() + 10 * 60 * 1000);
 
     await this.prisma.user.update({
-      where: { email },
+      where: { id: user.id },
       data: {
         otp,
         otpExpiry,
         otpVerified: false,
+        resetToken: null,
+        resetTokenExpiry: null,
       },
     });
 
-    // TODO: Send OTP via SMS or email based on method
-    console.log(`OTP for ${email} (${method || 'email'}): ${otp}`);
+    await this.sendVerificationOtpEmail(user.email, otp);
 
     return {
-      message: `OTP sent to your ${method || 'email'}`,
+      message: `OTP sent to your ${deliveryMethod}`,
       otpExpiry,
     };
   }
@@ -1775,7 +2957,7 @@ export class UsersService {
   ): Promise<{ message: string; resetToken: string }> {
     const { email, otp } = verifyOtpDto;
 
-    const user = await this.prisma.user.findUnique({ where: { email } });
+    const user = await this.findUserByEmail(email);
     if (!user) {
       throw new NotFoundException('User not found');
     }
@@ -1793,18 +2975,16 @@ export class UsersService {
     }
 
     // Generate reset token
-    const resetToken = jwt.sign(
-      { email, purpose: 'reset-password' },
-      this.configService.get('JWT_SECRET'),
-      { expiresIn: '15m' },
-    );
+    const resetToken = crypto.randomBytes(32).toString('hex');
 
     const resetTokenExpiry = new Date(Date.now() + 15 * 60 * 1000);
 
     await this.prisma.user.update({
-      where: { email },
+      where: { id: user.id },
       data: {
         otpVerified: true,
+        otp: null,
+        otpExpiry: null,
         resetToken,
         resetTokenExpiry,
       },
@@ -1814,7 +2994,7 @@ export class UsersService {
   }
 
   async requestEmailVerificationOtp(email: string): Promise<{ message: string; otpExpiry: Date }> {
-    const user = await this.prisma.user.findUnique({ where: { email } });
+    const user = await this.findUserByEmail(email);
     if (!user) {
       throw new NotFoundException('User not found');
     }
@@ -1826,7 +3006,7 @@ export class UsersService {
     const otp = Math.floor(10000 + Math.random() * 90000).toString();
     const otpExpiry = new Date(Date.now() + 10 * 60 * 1000);
     await this.prisma.user.update({
-      where: { email },
+      where: { id: user.id },
       data: {
         otp,
         otpExpiry,
@@ -1834,7 +3014,7 @@ export class UsersService {
       },
     });
 
-    await this.sendVerificationOtpEmail(email, otp);
+    await this.sendVerificationOtpEmail(user.email, otp);
     return { message: 'Verification OTP sent to email', otpExpiry };
   }
 
@@ -1842,8 +3022,8 @@ export class UsersService {
     verifyOtpDto: VerifyOtpDto,
   ): Promise<{ message: string; token: string; user: Partial<any> }> {
     const { email, otp } = verifyOtpDto;
-    const user = await this.prisma.user.findUnique({
-      where: { email },
+    const user = await this.prisma.user.findFirst({
+      where: { email: { equals: this.normalizeEmail(email), mode: 'insensitive' } },
       include: { permissions: true, branch: true, clientBusiness: true },
     });
     if (!user) {
@@ -1864,7 +3044,7 @@ export class UsersService {
     }
 
     const updated = await this.prisma.user.update({
-      where: { email },
+      where: { id: user.id },
       data: {
         otpVerified: true,
         otp: null,
@@ -1881,11 +3061,7 @@ export class UsersService {
       },
     });
 
-    const token = jwt.sign(
-      { userId: updated.id, email: updated.email },
-      this.configService.get('JWT_SECRET'),
-      { expiresIn: '1h' },
-    );
+    const token = this.signAuthToken(updated);
 
     const userData = {
       id: updated.id,
@@ -1920,9 +3096,16 @@ export class UsersService {
   async resetPassword(
     resetPasswordDto: ResetPasswordDto,
   ): Promise<{ message: string }> {
-    const { email, resetToken, newPassword } = resetPasswordDto;
+    const { email, resetToken, newPassword, confirmPassword } = resetPasswordDto;
+    if (newPassword !== confirmPassword) {
+      throw new BadRequestException(
+        'New password and confirm password do not match',
+      );
+    }
+    this.validatePasswordStrength(newPassword);
 
-    const user = await this.prisma.user.findUnique({ where: { email } });
+
+    const user = await this.findUserByEmail(email);
     if (!user) {
       throw new NotFoundException('User not found');
     }
@@ -1942,9 +3125,13 @@ export class UsersService {
     const hashedPassword = await bcrypt.hash(newPassword, 10);
 
     await this.prisma.user.update({
-      where: { email },
+      where: { id: user.id },
       data: {
         password: hashedPassword,
+        ...(String(user.status || '').toLowerCase() === 'blocked' ||
+        String(user.status || '').toLowerCase() === 'deactive'
+          ? { status: 'active' as any }
+          : {}),
         otp: null,
         otpExpiry: null,
         otpVerified: false,
@@ -1954,6 +3141,39 @@ export class UsersService {
     });
 
     return { message: 'Password reset successfully' };
+  }
+
+  async reactivateAccount(
+    reactivateDto: ReactivateAccountDto,
+  ): Promise<{ message: string }> {
+    const { email, resetToken } = reactivateDto;
+    const user = await this.findUserByEmail(email);
+    if (!user) {
+      throw new NotFoundException('User not found');
+    }
+    if (!user.resetToken || user.resetToken !== resetToken) {
+      throw new BadRequestException('Invalid reset token');
+    }
+    if (!user.resetTokenExpiry || new Date() > user.resetTokenExpiry) {
+      throw new BadRequestException('Reset token has expired');
+    }
+    if (!user.otpVerified) {
+      throw new BadRequestException('OTP not verified');
+    }
+
+    await this.prisma.user.update({
+      where: { id: user.id },
+      data: {
+        status: 'active' as any,
+        otp: null,
+        otpExpiry: null,
+        otpVerified: false,
+        resetToken: null,
+        resetTokenExpiry: null,
+      },
+    });
+
+    return { message: 'Account reactivated successfully' };
   }
 
   async setPin(setPinDto: SetPinDto): Promise<{ message: string }> {

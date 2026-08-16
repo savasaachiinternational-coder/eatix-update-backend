@@ -60,12 +60,14 @@ import { SponsoredModule } from './sponsored/sponsored.module';
 import { FeaturedModule } from './featured/featured.module';
 import { MenuModule } from './menu/menu.module';
 import { RestaurantOrderModule } from './restaurant-order/restaurant-order.module';
+import { RestaurantBookingModule } from './restaurant-booking/restaurant-booking.module';
 import { VendorFeaturedModule } from './vendor-featured/vendor-featured.module';
 import { VendorSponsoredModule } from './vendor-sponsored/vendor-sponsored.module';
 import { PromotionModule } from './promotion/promotion.module';
 import { AppRatingModule } from './app-rating/app-rating.module';
 import { SocialAccountsModule } from './social-accounts/social-accounts.module';
 import { SocialAuthModule } from './social-auth/social-auth.module';
+import { PaymentsModule } from './payments/payments.module';
 
 @Module({
   providers: [SocketService],
@@ -130,12 +132,14 @@ import { SocialAuthModule } from './social-auth/social-auth.module';
     FeaturedModule,
     MenuModule,
     RestaurantOrderModule,
+    RestaurantBookingModule,
     VendorFeaturedModule,
     VendorSponsoredModule,
     PromotionModule,
     AppRatingModule,
     SocialAccountsModule,
     SocialAuthModule,
+    PaymentsModule,
   ],
 })
 export class AppModule implements NestModule {

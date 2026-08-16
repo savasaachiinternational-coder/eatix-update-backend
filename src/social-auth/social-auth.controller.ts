@@ -1,4 +1,4 @@
-import { Controller, Get, Query } from '@nestjs/common';
+import { Body, Controller, Get, Post, Query } from '@nestjs/common';
 import { SocialAuthService } from './social-auth.service';
 
 @Controller('social-auth')
@@ -6,8 +6,17 @@ export class SocialAuthController {
   constructor(private readonly socialAuthService: SocialAuthService) {}
 
   @Get('facebook/connect')
-  facebookConnect(@Query('userId') userId: string) {
-    return this.socialAuthService.getFacebookConnectUrl(userId);
+  facebookConnect(
+    @Query('userId') userId: string,
+    @Query('instagram') instagram?: string,
+  ) {
+    const includeInstagram =
+      String(instagram || '').toLowerCase() === '1' ||
+      String(instagram || '').toLowerCase() === 'true';
+    return this.socialAuthService.getFacebookConnectUrl(
+      userId,
+      includeInstagram,
+    );
   }
 
   @Get('facebook/callback')
@@ -32,8 +41,27 @@ export class SocialAuthController {
   }
 
   @Get('youtube/connect')
-  youtubeConnect(@Query('userId') userId: string) {
-    return this.socialAuthService.getYouTubeConnectUrl(userId);
+  youtubeConnect(
+    @Query('userId') userId: string,
+    @Query('mode') mode?: string,
+  ) {
+    return this.socialAuthService.getYouTubeConnectUrl(userId, mode);
+  }
+
+  @Post('youtube/connect-mobile')
+  youtubeConnectMobile(
+    @Body()
+    body: {
+      userId?: string;
+      serverAuthCode?: string;
+      mode?: string;
+    },
+  ) {
+    return this.socialAuthService.handleYouTubeMobileConnect(
+      String(body?.userId || ''),
+      String(body?.serverAuthCode || ''),
+      body?.mode,
+    );
   }
 
   @Get('youtube/callback')
@@ -44,10 +72,13 @@ export class SocialAuthController {
     @Query('error_description') errorDescription: string,
   ) {
     if (error) {
+      const denied = String(error).toLowerCase() === 'access_denied';
       return {
         success: false,
         error: error,
-        message: errorDescription || 'YouTube authorization was denied or failed',
+        message: denied
+          ? 'Google blocked access (403). While the OAuth app is in Testing mode, each Gmail must be added under Google Cloud Console → OAuth consent screen → Test users. Verify YouTube only requests youtube.readonly; scheduled uploads need youtube.upload after app verification.'
+          : errorDescription || 'YouTube authorization was denied or failed',
       };
     }
     if (!code) {

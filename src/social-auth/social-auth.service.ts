@@ -33,9 +33,19 @@ export class SocialAuthService {
    *   Some Meta apps need: instagram_business_basic,instagram_business_content_publish
    *   (match what “Permissions and features” lists for your use case).
    */
-  private getFacebookLoginScopes(): string {
+  private getFacebookInstagramScopePart(): string {
+    const igCustom = this.config
+      .get<string>('FACEBOOK_INSTAGRAM_LOGIN_SCOPES')
+      ?.trim();
+    return igCustom || FB_LOGIN_SCOPES_INSTAGRAM_DEFAULT;
+  }
+
+  private getFacebookLoginScopes(includeInstagram = false): string {
     const full = this.config.get<string>('FACEBOOK_LOGIN_SCOPES')?.trim();
     if (full) return full;
+    if (!includeInstagram) {
+      return FB_LOGIN_SCOPES_CORE;
+    }
     const enableIg =
       String(
         this.config.get<string>('FACEBOOK_ENABLE_INSTAGRAM_LOGIN') ?? '',
@@ -43,14 +53,10 @@ export class SocialAuthService {
     if (!enableIg) {
       return FB_LOGIN_SCOPES_CORE;
     }
-    const igCustom = this.config
-      .get<string>('FACEBOOK_INSTAGRAM_LOGIN_SCOPES')
-      ?.trim();
-    const igPart = igCustom || FB_LOGIN_SCOPES_INSTAGRAM_DEFAULT;
-    return `${FB_LOGIN_SCOPES_CORE},${igPart}`;
+    return `${FB_LOGIN_SCOPES_CORE},${this.getFacebookInstagramScopePart()}`;
   }
 
-  getFacebookConnectUrl(userId: string) {
+  getFacebookConnectUrl(userId: string, includeInstagram = false) {
     if (!userId) throw new BadRequestException('userId is required');
     const appId = this.config.get<string>('FACEBOOK_APP_ID');
     const appUrl =
@@ -60,7 +66,9 @@ export class SocialAuthService {
     }
     const redirectUri = `${appUrl}/social-auth/facebook/callback`;
     const state = encodeURIComponent(JSON.stringify({ userId }));
-    const scopes = encodeURIComponent(this.getFacebookLoginScopes());
+    const scopes = encodeURIComponent(
+      this.getFacebookLoginScopes(includeInstagram),
+    );
     const url =
       `https://www.facebook.com/${FB_GRAPH_VERSION}/dialog/oauth?client_id=${encodeURIComponent(
         appId,
@@ -326,74 +334,50 @@ export class SocialAuthService {
     };
   }
 
-  private getYouTubeOAuthScopes(): string {
+  private getYouTubeOAuthScopes(mode?: string): string {
     const custom = this.config.get<string>('GOOGLE_YOUTUBE_SCOPES')?.trim();
     if (custom) return custom;
-    return [
-      'https://www.googleapis.com/auth/youtube.readonly',
-      'https://www.googleapis.com/auth/youtube.upload',
-    ].join(' ');
-  }
-
-  getYouTubeConnectUrl(userId: string) {
-    if (!userId) throw new BadRequestException('userId is required');
-    const clientId = this.config.get<string>('GOOGLE_CLIENT_ID');
-    const appUrl =
-      this.config.get<string>('APP_URL') || 'http://localhost:3000/v1';
-    if (!clientId) {
-      throw new BadRequestException('GOOGLE_CLIENT_ID is not configured');
+    const verifyScopes =
+      this.config.get<string>('GOOGLE_YOUTUBE_VERIFY_SCOPES')?.trim() ||
+      'https://www.googleapis.com/auth/youtube.readonly';
+    const publishScopes =
+      this.config.get<string>('GOOGLE_YOUTUBE_PUBLISH_SCOPES')?.trim() ||
+      'https://www.googleapis.com/auth/youtube.upload';
+    if (String(mode || '').toLowerCase() === 'publish') {
+      return `${verifyScopes} ${publishScopes}`.trim();
     }
-    const redirectUri = `${appUrl}/social-auth/youtube/callback`;
-    this.logger.log(`YouTube OAuth redirect_uri: ${redirectUri}`);
-    const state = encodeURIComponent(JSON.stringify({ userId }));
-    const scope = encodeURIComponent(this.getYouTubeOAuthScopes());
-    const url =
-      `https://accounts.google.com/o/oauth2/v2/auth?client_id=${encodeURIComponent(
-        clientId,
-      )}` +
-      `&redirect_uri=${encodeURIComponent(redirectUri)}` +
-      `&response_type=code` +
-      `&scope=${scope}` +
-      `&state=${state}` +
-      `&access_type=offline` +
-      `&prompt=consent`;
-    return { url };
+    return verifyScopes;
   }
 
-  async handleYouTubeCallback(code: string, state: string) {
-    if (!code) throw new BadRequestException('code is required');
+  private getGoogleOAuthCredentials() {
     const clientId = this.config.get<string>('GOOGLE_CLIENT_ID');
     const clientSecret = this.config.get<string>('GOOGLE_CLIENT_SECRET');
-    const appUrl =
-      this.config.get<string>('APP_URL') || 'http://localhost:3000/v1';
     if (!clientId || !clientSecret) {
       throw new BadRequestException(
         'GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET not configured',
       );
     }
-    const redirectUri = `${appUrl}/social-auth/youtube/callback`;
-    let parsedState: { userId?: string } = {};
-    try {
-      parsedState = JSON.parse(decodeURIComponent(state || '{}'));
-    } catch {
-      parsedState = {};
-    }
-    const userId = parsedState.userId;
-    if (!userId) throw new BadRequestException('Invalid state/userId');
+    return { clientId, clientSecret };
+  }
 
-    let tokenRes: { data?: Record<string, unknown> };
+  private async exchangeGoogleAuthCode(params: {
+    code: string;
+    redirectUri: string;
+  }): Promise<Record<string, unknown>> {
+    const { clientId, clientSecret } = this.getGoogleOAuthCredentials();
     try {
-      tokenRes = await axios.post(
+      const tokenRes = await axios.post(
         'https://oauth2.googleapis.com/token',
         new URLSearchParams({
           client_id: clientId,
           client_secret: clientSecret,
-          code,
+          code: params.code,
           grant_type: 'authorization_code',
-          redirect_uri: redirectUri,
+          redirect_uri: params.redirectUri,
         }).toString(),
         { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } },
       );
+      return (tokenRes.data || {}) as Record<string, unknown>;
     } catch (e: any) {
       const d = e?.response?.data;
       throw new BadRequestException(
@@ -405,15 +389,23 @@ export class SocialAuthService {
         ),
       );
     }
-    const accessToken = String(tokenRes.data?.access_token || '');
-    const refreshToken = tokenRes.data?.refresh_token
-      ? String(tokenRes.data.refresh_token)
+  }
+
+  private async saveYouTubeChannelsFromTokens(
+    userId: string,
+    tokenData: Record<string, unknown>,
+  ) {
+    const accessToken = String(tokenData?.access_token || '');
+    const refreshToken = tokenData?.refresh_token
+      ? String(tokenData.refresh_token)
       : '';
     if (!accessToken) {
       throw new BadRequestException('Could not retrieve Google access token');
     }
 
-    let channelsRes: { data?: { items?: Array<{ id?: string; snippet?: { title?: string } }> } };
+    let channelsRes: {
+      data?: { items?: Array<{ id?: string; snippet?: { title?: string } }> };
+    };
     try {
       channelsRes = await axios.get(
         'https://www.googleapis.com/youtube/v3/channels',
@@ -451,8 +443,8 @@ export class SocialAuthService {
         accessToken,
         refreshToken: refreshToken || undefined,
         metadata: {
-          scope: tokenRes.data?.scope,
-          tokenType: tokenRes.data?.token_type,
+          scope: tokenData?.scope,
+          tokenType: tokenData?.token_type,
         },
       });
       saved.push(row);
@@ -463,6 +455,71 @@ export class SocialAuthService {
       savedCount: saved.length,
       accounts: saved,
     };
+  }
+
+  getYouTubeConnectUrl(userId: string, mode?: string) {
+    if (!userId) throw new BadRequestException('userId is required');
+    const clientId = this.config.get<string>('GOOGLE_CLIENT_ID');
+    const appUrl =
+      this.config.get<string>('APP_URL') || 'http://localhost:3000/v1';
+    if (!clientId) {
+      throw new BadRequestException('GOOGLE_CLIENT_ID is not configured');
+    }
+    const redirectUri = `${appUrl}/social-auth/youtube/callback`;
+    this.logger.log(`YouTube OAuth redirect_uri: ${redirectUri}`);
+    const state = encodeURIComponent(
+      JSON.stringify({ userId, mode: mode || 'verify' }),
+    );
+    const scope = encodeURIComponent(this.getYouTubeOAuthScopes(mode));
+    const url =
+      `https://accounts.google.com/o/oauth2/v2/auth?client_id=${encodeURIComponent(
+        clientId,
+      )}` +
+      `&redirect_uri=${encodeURIComponent(redirectUri)}` +
+      `&response_type=code` +
+      `&scope=${scope}` +
+      `&state=${state}` +
+      `&access_type=offline` +
+      `&prompt=consent` +
+      `&include_granted_scopes=true`;
+    return { url, mode: mode || 'verify' };
+  }
+
+  async handleYouTubeMobileConnect(
+    userId: string,
+    serverAuthCode: string,
+    mode?: string,
+  ) {
+    if (!userId) throw new BadRequestException('userId is required');
+    if (!serverAuthCode) {
+      throw new BadRequestException('serverAuthCode is required');
+    }
+    const tokenData = await this.exchangeGoogleAuthCode({
+      code: serverAuthCode,
+      redirectUri: '',
+    });
+    return this.saveYouTubeChannelsFromTokens(userId, tokenData);
+  }
+
+  async handleYouTubeCallback(code: string, state: string) {
+    if (!code) throw new BadRequestException('code is required');
+    const appUrl =
+      this.config.get<string>('APP_URL') || 'http://localhost:3000/v1';
+    const redirectUri = `${appUrl}/social-auth/youtube/callback`;
+    let parsedState: { userId?: string; mode?: string } = {};
+    try {
+      parsedState = JSON.parse(decodeURIComponent(state || '{}'));
+    } catch {
+      parsedState = {};
+    }
+    const userId = parsedState.userId;
+    if (!userId) throw new BadRequestException('Invalid state/userId');
+
+    const tokenData = await this.exchangeGoogleAuthCode({
+      code,
+      redirectUri,
+    });
+    return this.saveYouTubeChannelsFromTokens(userId, tokenData);
   }
 }
 

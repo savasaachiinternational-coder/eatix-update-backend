@@ -14,6 +14,7 @@ import { ApiTags, ApiOperation, ApiResponse } from '@nestjs/swagger';
 import { RestaurantOrderService } from './restaurant-order.service';
 import { CreateRestaurantOrderDto } from './dto/create-restaurant-order.dto';
 import { UpdateRestaurantOrderStatusDto } from './dto/update-restaurant-order-status.dto';
+import { AssignRiderDto } from './dto/assign-rider.dto';
 import { UpsertRestaurantOrderReviewDto } from './dto/upsert-restaurant-order-review.dto';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 import { AdminRoleGuard } from '../auth/AdminRoleGuard';
@@ -72,6 +73,14 @@ export class RestaurantOrderController {
     return this.restaurantOrderService.getEarnings(user.id);
   }
 
+  @Get('counts')
+  @UseGuards(JwtAuthGuard)
+  @ApiOperation({ summary: 'Order counts for badge / rider dashboard' })
+  @ApiResponse({ status: 200, description: 'Pending, completed, rejected counts' })
+  getCounts(@CurrentUser() user: { id: string; role: string }) {
+    return this.restaurantOrderService.getOrderCounts(user.id, user.role);
+  }
+
   @Get('subscribers-who-ordered')
   @UseGuards(JwtAuthGuard)
   @ApiOperation({
@@ -94,10 +103,22 @@ export class RestaurantOrderController {
   getTopRestaurants(
     @Query('page') page?: string,
     @Query('limit') limit?: string,
+    @Query('nearbyLat') nearbyLat?: string,
+    @Query('nearbyLng') nearbyLng?: string,
+    @Query('radiusKm') radiusKm?: string,
   ) {
+    const lat = nearbyLat != null ? parseFloat(nearbyLat) : undefined;
+    const lng = nearbyLng != null ? parseFloat(nearbyLng) : undefined;
+    const radius =
+      radiusKm != null ? parseFloat(radiusKm) : undefined;
     return this.restaurantOrderService.getTopRestaurantsByOrders(
       page ? parseInt(page, 10) : 1,
       limit ? parseInt(limit, 10) : 20,
+      {
+        nearbyLat: Number.isFinite(lat!) ? lat : undefined,
+        nearbyLng: Number.isFinite(lng!) ? lng : undefined,
+        radiusKm: Number.isFinite(radius!) ? radius : undefined,
+      },
     );
   }
 
@@ -151,6 +172,60 @@ export class RestaurantOrderController {
     return this.restaurantOrderService.deleteReview(id, user.id, user.role);
   }
 
+  @Get('rider-reviews')
+  @UseGuards(JwtAuthGuard)
+  @ApiOperation({ summary: 'List rider reviews (rider: own reviews, admin: all)' })
+  @ApiResponse({ status: 200, description: 'Rider reviews list' })
+  listRiderReviews(
+    @CurrentUser() user: { id: string; role: string },
+    @Query('page') page?: string,
+    @Query('perPage') perPage?: string,
+  ) {
+    return this.restaurantOrderService.listRiderReviewsForRider(user.id, user.role, {
+      page: page ? parseInt(page, 10) : undefined,
+      perPage: perPage ? parseInt(perPage, 10) : undefined,
+    });
+  }
+
+  @Get(':id/rider-review')
+  @UseGuards(JwtAuthGuard)
+  @ApiOperation({ summary: 'Get rider review for an order' })
+  @ApiResponse({ status: 200, description: 'Rider review (or null)' })
+  getRiderReview(
+    @Param('id') id: string,
+    @CurrentUser() user: { id: string; role: string },
+  ) {
+    return this.restaurantOrderService.getRiderReview(id, user.id, user.role);
+  }
+
+  @Patch(':id/rider-review')
+  @UseGuards(JwtAuthGuard)
+  @ApiOperation({ summary: 'Create/update rider review for an order (customer)' })
+  @ApiResponse({ status: 200, description: 'Upserted rider review' })
+  upsertRiderReview(
+    @Param('id') id: string,
+    @CurrentUser() user: { id: string; role: string },
+    @Body() dto: UpsertRestaurantOrderReviewDto,
+  ) {
+    return this.restaurantOrderService.upsertRiderReview(
+      id,
+      user.id,
+      user.role,
+      dto,
+    );
+  }
+
+  @Delete(':id/rider-review')
+  @UseGuards(JwtAuthGuard)
+  @ApiOperation({ summary: 'Delete rider review for an order' })
+  @ApiResponse({ status: 200, description: 'Deleted' })
+  deleteRiderReview(
+    @Param('id') id: string,
+    @CurrentUser() user: { id: string; role: string },
+  ) {
+    return this.restaurantOrderService.deleteRiderReview(id, user.id, user.role);
+  }
+
   @Get(':id')
   @UseGuards(JwtAuthGuard)
   @ApiOperation({ summary: 'Get one order by ID' })
@@ -160,6 +235,38 @@ export class RestaurantOrderController {
     @CurrentUser() user: { id: string; role: string },
   ) {
     return this.restaurantOrderService.findOne(id, user.id, user.role);
+  }
+
+  @Patch(':id/assign-rider')
+  @UseGuards(JwtAuthGuard)
+  @ApiOperation({ summary: 'Assign a delivery rider (restaurant owner)' })
+  @ApiResponse({ status: 200, description: 'Order updated with rider' })
+  assignRider(
+    @Param('id') id: string,
+    @CurrentUser() user: { id: string; role: string },
+    @Body() dto: AssignRiderDto,
+  ) {
+    return this.restaurantOrderService.assignRider(
+      id,
+      user.id,
+      user.role,
+      dto.riderId,
+    );
+  }
+
+  @Patch(':id/reject-assignment')
+  @UseGuards(JwtAuthGuard)
+  @ApiOperation({ summary: 'Rider declines an assigned delivery' })
+  @ApiResponse({ status: 200, description: 'Order returned to preparing for reassignment' })
+  rejectAssignment(
+    @Param('id') id: string,
+    @CurrentUser() user: { id: string; role: string },
+  ) {
+    return this.restaurantOrderService.rejectRiderAssignment(
+      id,
+      user.id,
+      user.role,
+    );
   }
 
   @Patch(':id/status')

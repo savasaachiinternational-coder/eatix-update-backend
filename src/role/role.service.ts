@@ -50,13 +50,31 @@ export class RoleService {
     return this.findOne(role.id);
   }
 
+  private static readonly PUBLIC_SIGNUP_ROLES = ['user', 'owner', 'vendor'];
+
   // Public list for signup dropdown (id + name only)
   async findList() {
     const roles = await this.prisma.role.findMany({
+      where: {
+        name: {
+          in: RoleService.PUBLIC_SIGNUP_ROLES,
+          mode: 'insensitive',
+        },
+      },
       select: { id: true, name: true },
       orderBy: { name: 'asc' },
     });
-    return { roles };
+
+    if (roles.length > 0) {
+      return { roles };
+    }
+
+    return {
+      roles: RoleService.PUBLIC_SIGNUP_ROLES.map(name => ({
+        id: name,
+        name,
+      })),
+    };
   }
 
   // Get all roles

@@ -2,6 +2,8 @@ import {
   Controller,
   Post,
   Get,
+  Patch,
+  Delete,
   Body,
   Param,
   Query,
@@ -21,8 +23,10 @@ import {
 } from '@nestjs/swagger';
 import { PromotionService } from './promotion.service';
 import { CreatePromotionDto } from './dto/create-promotion.dto';
+import { UpdatePromotionDto } from './dto/update-promotion.dto';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 import { OwnerOrVendorGuard } from '../auth/owner-or-vendor.guard';
+import { multerOptions } from '../../middleware/multer.config';
 
 @ApiTags('promotions')
 @Controller('promotions')
@@ -65,11 +69,13 @@ export class PromotionController {
     @Param('userId') userId: string,
     @Query('page') page?: number,
     @Query('limit') limit?: number,
+    @Query('offerType') offerType?: string,
   ) {
     return this.promotionService.getByUserId(
       userId,
       page ? Number(page) : 1,
       limit ? Number(limit) : 50,
+      offerType,
     );
   }
 
@@ -122,7 +128,7 @@ export class PromotionController {
   })
   @ApiResponse({ status: 201, description: 'Promotion uploaded' })
   @ApiResponse({ status: 403, description: 'Only owner or vendor can create' })
-  @UseInterceptors(FilesInterceptor('files', 2))
+  @UseInterceptors(FilesInterceptor('files', 2, multerOptions))
   async upload(
     @UploadedFiles() files: Express.Multer.File[],
     @Body()
@@ -136,6 +142,10 @@ export class PromotionController {
       expireDate: string;
       menuItemIds?: string;
       duration?: number;
+      offerType?: string;
+      fulfillmentScopes?: string | string[];
+      discountTiers?: string;
+      tierMetricType?: string;
     },
     @Request() req: { user: { id: string } },
   ) {
@@ -172,7 +182,101 @@ export class PromotionController {
         expireDate: body.expireDate,
         menuItemIds,
         duration: body.duration != null ? Number(body.duration) : undefined,
+        offerType: body.offerType,
+        fulfillmentScopes: typeof body.fulfillmentScopes === 'string' ? body.fulfillmentScopes.split(',').map(s => s.trim()).filter(Boolean) : body.fulfillmentScopes,
+        discountTiers: body.discountTiers,
+        tierMetricType: body.tierMetricType,
       },
+      req.user.id,
+    );
+  }
+
+  @Patch(':promotionId/upload')
+  @UseGuards(JwtAuthGuard, OwnerOrVendorGuard)
+  @ApiOperation({
+    summary: 'Update promotion with optional new thumbnail/video files',
+  })
+  @ApiConsumes('multipart/form-data')
+  @UseInterceptors(FilesInterceptor('files', 2, multerOptions))
+  async updateUpload(
+    @Param('promotionId') promotionId: string,
+    @UploadedFiles() files: Express.Multer.File[],
+    @Body()
+    body: {
+      userId: string;
+      title?: string;
+      description?: string;
+      promoAmount?: string | number;
+      promoCode?: string;
+      startDate?: string;
+      expireDate?: string;
+      menuItemIds?: string;
+      duration?: number;
+      offerType?: string;
+      fulfillmentScopes?: string | string[];
+      discountTiers?: string;
+      tierMetricType?: string;
+    },
+    @Request() req: { user: { id: string } },
+  ) {
+    const promoAmount =
+      body.promoAmount == null || body.promoAmount === ''
+        ? undefined
+        : typeof body.promoAmount === 'number'
+          ? body.promoAmount
+          : parseFloat(String(body.promoAmount));
+    return this.promotionService.updateWithUpload(
+      promotionId,
+      files || [],
+      {
+        userId: body.userId,
+        title: body.title,
+        description: body.description,
+        promoAmount:
+          promoAmount != null && !Number.isNaN(promoAmount)
+            ? promoAmount
+            : undefined,
+        promoCode: body.promoCode,
+        startDate: body.startDate,
+        expireDate: body.expireDate,
+        menuItemIds: body.menuItemIds as unknown as string[],
+        duration: body.duration != null ? Number(body.duration) : undefined,
+        offerType: body.offerType,
+        fulfillmentScopes: typeof body.fulfillmentScopes === 'string' ? body.fulfillmentScopes.split(',').map(s => s.trim()).filter(Boolean) : body.fulfillmentScopes,
+        discountTiers: body.discountTiers,
+        tierMetricType: body.tierMetricType,
+      },
+      req.user.id,
+    );
+  }
+
+  @Patch(':promotionId')
+  @UseGuards(JwtAuthGuard, OwnerOrVendorGuard)
+  @ApiOperation({ summary: 'Update promotion (owner or vendor)' })
+  async update(
+    @Param('promotionId') promotionId: string,
+    @Body() body: UpdatePromotionDto,
+    @Request() req: { user: { id: string } },
+  ) {
+    return this.promotionService.update(
+      promotionId,
+      body.userId,
+      body,
+      req.user.id,
+    );
+  }
+
+  @Delete(':promotionId')
+  @UseGuards(JwtAuthGuard, OwnerOrVendorGuard)
+  @ApiOperation({ summary: 'Delete promotion (owner or vendor)' })
+  async delete(
+    @Param('promotionId') promotionId: string,
+    @Body() body: { userId: string },
+    @Request() req: { user: { id: string } },
+  ) {
+    return this.promotionService.delete(
+      promotionId,
+      body.userId,
       req.user.id,
     );
   }

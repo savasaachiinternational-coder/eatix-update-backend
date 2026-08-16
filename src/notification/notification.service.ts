@@ -10,6 +10,7 @@ import {
   UpdateNotificationStatusDto,
 } from './dto/create-notification.dto';
 import { NotificationGateway } from './notification.gateway';
+import { resolveOwnerAreaKm } from '../common/geo.util';
 
 @Injectable()
 export class NotificationService {
@@ -102,6 +103,128 @@ export class NotificationService {
       },
       orderBy: { createdAt: 'desc' },
     });
+  }
+
+  async getUnreadCount(userId: string): Promise<number> {
+    return this.prisma.notification.count({
+      where: {
+        OR: [{ userId }, { clientId: userId }],
+        status: { not: 'read' },
+      },
+    });
+  }
+
+  async markAllAsRead(userId: string) {
+    await this.prisma.notification.updateMany({
+      where: {
+        OR: [{ userId }, { clientId: userId }],
+        status: { not: 'read' },
+      },
+      data: { status: 'read' },
+    });
+    return { success: true };
+  }
+
+  private haversineKm(
+    lat1: number,
+    lon1: number,
+    lat2: number,
+    lon2: number,
+  ): number {
+    const R = 6371;
+    const dLat = ((lat2 - lat1) * Math.PI) / 180;
+    const dLon = ((lon2 - lon1) * Math.PI) / 180;
+    const a =
+      Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+      Math.cos((lat1 * Math.PI) / 180) *
+        Math.cos((lat2 * Math.PI) / 180) *
+        Math.sin(dLon / 2) *
+        Math.sin(dLon / 2);
+    return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  }
+
+  /**
+   * Notify channel subscribers and users within the creator's delivery area.
+   */
+  async notifySubscribersAndAreaUsers(params: {
+    creatorUserId: string;
+    message: string;
+    type: string;
+    contentId: string;
+    orderId?: string;
+    radiusKm?: number;
+  }) {
+    const creator = await this.prisma.user.findUnique({
+      where: { id: params.creatorUserId },
+      select: {
+        id: true,
+        latitude: true,
+        longitude: true,
+        contentAreaKm: true,
+        pickupAreaKm: true,
+        deliveryAreaKm: true,
+      },
+    });
+    if (!creator) return;
+
+    const [subscribers, usersWithLoc] = await Promise.all([
+      this.prisma.channelSubscription.findMany({
+        where: { channelUserId: params.creatorUserId },
+        select: { subscriberId: true },
+      }),
+      creator.latitude != null && creator.longitude != null
+        ? this.prisma.user.findMany({
+            where: {
+              latitude: { not: null },
+              longitude: { not: null },
+              id: { not: params.creatorUserId },
+            },
+            select: { id: true, latitude: true, longitude: true },
+          })
+        : Promise.resolve([]),
+    ]);
+
+    const recipientSet = new Set<string>(
+      subscribers.map((s) => s.subscriberId).filter(Boolean),
+    );
+
+    if (
+      creator.latitude != null &&
+      creator.longitude != null &&
+      usersWithLoc.length
+    ) {
+      const ownerMaxKm = resolveOwnerAreaKm(creator, 'content');
+      const effectiveRadiusKm =
+        ownerMaxKm != null
+          ? Math.min(params.radiusKm ?? 50, ownerMaxKm)
+          : params.radiusKm ?? 50;
+
+      for (const u of usersWithLoc) {
+        if (u.latitude == null || u.longitude == null) continue;
+        const distanceKm = this.haversineKm(
+          creator.latitude,
+          creator.longitude,
+          u.latitude,
+          u.longitude,
+        );
+        if (distanceKm <= effectiveRadiusKm) {
+          recipientSet.add(u.id);
+        }
+      }
+    }
+
+    recipientSet.delete(params.creatorUserId);
+
+    const tasks = Array.from(recipientSet).map((userId) =>
+      this.createNotification({
+        userId,
+        message: params.message,
+        type: params.type,
+        contentId: params.contentId,
+        orderId: params.orderId,
+      }).catch(() => null),
+    );
+    await Promise.all(tasks);
   }
 
   async getNotificationsByCompanyId(companyId: string) {

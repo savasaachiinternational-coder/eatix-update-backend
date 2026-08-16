@@ -1,16 +1,16 @@
 import { NestFactory } from '@nestjs/core';
 import { AppModule } from './app.module';
-import * as cookieParser from 'cookie-parser';
-import * as cors from 'cors';
+import cookieParser from 'cookie-parser';
+import cors from 'cors';
 import { ConfigService } from '@nestjs/config';
 import { DocumentBuilder, SwaggerModule } from '@nestjs/swagger';
 import { BadRequestException, ValidationPipe } from '@nestjs/common';
 import { ValidationError } from 'class-validator';
-import * as express from 'express';
+import express from 'express';
 import { AllExceptionsFilter } from './filter-all-exceptions.filter';
 
 async function bootstrap() {
-  const app = await NestFactory.create(AppModule);
+  const app = await NestFactory.create(AppModule, { rawBody: true });
   const configService = app.get(ConfigService);
   const port = configService.get<number>('PORT');
   app.useGlobalFilters(new AllExceptionsFilter());
@@ -28,15 +28,21 @@ async function bootstrap() {
         enableImplicitConversion: true,
       },
       whitelist: true,
-      forbidNonWhitelisted: true,
+      forbidNonWhitelisted: false,
       exceptionFactory: (errors: ValidationError[]) => {
         const formattedErrors = errors.map((error) => ({
           property: error.property,
           constraints: error.constraints,
           children: error.children?.length > 0 ? error.children : undefined,
         }));
+        const first = formattedErrors[0];
+        const detail =
+          first?.constraints && Object.values(first.constraints)[0];
+        const hint = detail
+          ? `${detail}${first.property ? ` (${first.property})` : ''}`
+          : 'Validation failed';
         return new BadRequestException({
-          message: 'Validation failed',
+          message: hint,
           errors: formattedErrors,
         });
       },

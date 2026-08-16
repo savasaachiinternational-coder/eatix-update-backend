@@ -5,7 +5,6 @@ import {
   ServiceUnavailableException,
   Logger,
 } from '@nestjs/common';
-import * as jwt from 'jsonwebtoken';
 import { PrismaService } from '../prisma/prisma.service';
 import { R2StorageService } from '../r2-storage/r2-storage.service';
 import { SubscriptionService } from '../subscription/subscription.service';
@@ -21,8 +20,21 @@ import {
   VideoCommentLikeDto,
   VideoCommentDislikeDto,
   VideoCommentDeleteDto,
+  VideoCommentUpdateDto,
   VideoViewDto,
 } from './dto/video.dto';
+import {
+  extractVideoThumbnailFromMulterFile,
+  multerFileFromBuffer,
+} from '../common/video-thumbnail.util';
+import { UK_DEFAULT_RADIUS_KM } from '../common/geo.util';
+import { resolveNearbyUserIds } from '../common/nearby-users.cache';
+import {
+  assertViewerCanSeeCreatorContent,
+  canViewerSeeCreatorContent,
+  creatorRoleWhereForViewer,
+  normalizeViewerRole,
+} from '../common/content-visibility.util';
 
 @Injectable()
 export class VideoService {
@@ -48,32 +60,12 @@ export class VideoService {
     }
   }
 
-  private viewerIsChannelOwner(
-    authHeader: string | undefined,
-    channelUserId: string,
-  ): boolean {
-    if (!authHeader?.startsWith('Bearer ')) return false;
-    const secret = process.env.JWT_SECRET;
-    if (!secret) return false;
-    try {
-      const payload = jwt.verify(
-        authHeader.slice(7),
-        secret,
-      ) as { sub?: string };
-      return (
-        payload?.sub != null && String(payload.sub) === String(channelUserId)
-      );
-    } catch {
-      return false;
-    }
-  }
-
   /**
    * Upload video with thumbnail
    */
   async uploadVideo(
     videoFile: Express.Multer.File,
-    thumbnailFile: Express.Multer.File,
+    thumbnailFile: Express.Multer.File | null,
     createVideoDto: CreateVideoDto,
   ) {
     const limitCheck = await this.subscriptionService.checkCanUploadVideo(createVideoDto.userId);
@@ -87,9 +79,24 @@ export class VideoService {
         'videos',
       );
 
-      // Upload thumbnail to R2
+      let thumbFile = thumbnailFile;
+      if (!thumbFile) {
+        try {
+          const thumbBuffer = await extractVideoThumbnailFromMulterFile(videoFile);
+          thumbFile = multerFileFromBuffer(thumbBuffer);
+          this.logger.log('Auto-generated video thumbnail from uploaded file');
+        } catch (e: any) {
+          this.logger.warn(
+            `Video thumbnail auto-generation failed: ${e?.message || e}`,
+          );
+          throw new BadRequestException(
+            'Thumbnail is required or could not be generated from the video. Install ffmpeg on the server or upload a cover image.',
+          );
+        }
+      }
+
       const { url: thumbnailUrl, key: thumbnailKey } =
-        await this.r2Storage.uploadFile(thumbnailFile, 'thumbnails');
+        await this.r2Storage.uploadFile(thumbFile, 'thumbnails');
 
       // Create video record in database
       const video = await this.prisma.video.create({
@@ -150,6 +157,18 @@ export class VideoService {
       }
 
       this.logger.log(`Video uploaded successfully: ${video.id}`);
+      if ((video.visibility || 'public') === 'public') {
+        const creatorName =
+          video.user?.nickname || video.user?.name || 'Someone';
+        this.notificationService
+          .notifySubscribersAndAreaUsers({
+            creatorUserId: video.userId,
+            message: `${creatorName} uploaded a new video: ${video.title || 'Untitled'}`,
+            type: 'video_new',
+            contentId: video.id,
+          })
+          .catch(() => null);
+      }
       return video;
     } catch (error: any) {
       this.logger.error(`Error uploading video: ${error.message}`);
@@ -198,7 +217,7 @@ export class VideoService {
       sort,
       nearbyLat,
       nearbyLng,
-      radiusKm = 50,
+      radiusKm = UK_DEFAULT_RADIUS_KM,
       excludeSponsored = false,
       excludeFeatured = false,
       viewerRole,
@@ -211,10 +230,9 @@ export class VideoService {
       visibility: 'public',
     };
 
-    // When viewer role is "user": show only non-vendor uploads (owner, user, admin, etc.). When "vendor" or other: show all (owner + vendor).
-    const viewerRoleNorm = (viewerRole || 'user').toLowerCase();
-    if (viewerRoleNorm === 'user') {
-      where.user = { role: { not: 'vendor' } };
+    const roleFilter = creatorRoleWhereForViewer(viewerRole);
+    if (roleFilter) {
+      where.user = roleFilter;
     }
 
     if (userId) {
@@ -222,22 +240,13 @@ export class VideoService {
     }
 
     if (nearbyLat != null && nearbyLng != null) {
-      const usersWithLocation = await this.prisma.user.findMany({
-        where: {
-          latitude: { not: null },
-          longitude: { not: null },
-        },
-        select: { id: true, latitude: true, longitude: true },
-      });
-      const nearbyUserIds = usersWithLocation
-        .filter(
-          (u) =>
-            u.latitude != null &&
-            u.longitude != null &&
-            this.haversineKm(nearbyLat, nearbyLng, u.latitude, u.longitude) <=
-              radiusKm,
-        )
-        .map((u) => u.id);
+      const nearbyUserIds = await resolveNearbyUserIds(
+        this.prisma,
+        nearbyLat,
+        nearbyLng,
+        radiusKm,
+        viewerRole,
+      );
       where.userId = { in: nearbyUserIds.length > 0 ? nearbyUserIds : [''] };
     }
 
@@ -308,9 +317,8 @@ export class VideoService {
               id: true,
               name: true,
               nickname: true,
-              email: true,
-              phone: true,
-              address: true,
+              role: true,
+              photos: true,
               latitude: true,
               longitude: true,
             },
@@ -382,14 +390,11 @@ export class VideoService {
       throw new NotFoundException('Video not found');
     }
 
-    // When viewer has role "user", do not allow viewing vendor-uploaded videos
-    const viewerRoleNorm = (viewerRole || 'user').toLowerCase();
-    if (viewerRoleNorm === 'user') {
-      const uploaderRole = (video.user?.role || '').toLowerCase();
-      if (uploaderRole === 'vendor') {
-        throw new NotFoundException('Video not found');
-      }
-    }
+    assertViewerCanSeeCreatorContent(
+      viewerRole,
+      video.user?.role,
+      'Video not found',
+    );
 
     // Top-level comment count (excludes replies)
     const topLevelCommentCount = await this.prisma.videoComment.count({
@@ -929,6 +934,43 @@ export class VideoService {
   }
 
   /**
+   * Edit own comment or reply
+   */
+  async updateComment(dto: VideoCommentUpdateDto) {
+    const { commentId, userId, content } = dto;
+    const trimmed = String(content || '').trim();
+    if (!trimmed) {
+      throw new BadRequestException('Comment content is required');
+    }
+
+    const comment = await this.prisma.videoComment.findUnique({
+      where: { id: commentId },
+    });
+
+    if (!comment) {
+      throw new NotFoundException('Comment not found');
+    }
+
+    if (comment.userId !== userId) {
+      throw new BadRequestException('You can only edit your own comments');
+    }
+
+    return this.prisma.videoComment.update({
+      where: { id: commentId },
+      data: { content: trimmed },
+      include: {
+        user: {
+          select: {
+            id: true,
+            name: true,
+            nickname: true,
+          },
+        },
+      },
+    });
+  }
+
+  /**
    * Delete own comment or reply
    */
   async deleteComment(dto: VideoCommentDeleteDto) {
@@ -1050,7 +1092,8 @@ export class VideoService {
         (v) =>
           v.video &&
           v.video.status !== 'deleted' &&
-          v.video.visibility === 'public',
+          v.video.visibility === 'public' &&
+          (!v.video.scheduledPublishAt || v.video.scheduledPublishAt <= new Date()),
       )
       .map((v) => ({ video: v.video, watchedAt: v.createdAt }));
     return {
@@ -1091,7 +1134,8 @@ export class VideoService {
         (l) =>
           l.video &&
           l.video.status !== 'deleted' &&
-          l.video.visibility === 'public',
+          l.video.visibility === 'public' &&
+          (!l.video.scheduledPublishAt || l.video.scheduledPublishAt <= new Date()),
       )
       .map((l) => l.video);
     return {
@@ -1107,19 +1151,62 @@ export class VideoService {
     userId: string,
     page: number = 1,
     limit: number = 20,
-    authHeader?: string,
+    options?: {
+      viewerRole?: string;
+      viewerUserId?: string;
+      viewerLat?: number;
+      viewerLng?: number;
+    },
   ) {
+    const empty = {
+      videos: [],
+      pagination: {
+        total: 0,
+        page,
+        limit,
+        totalPages: 0,
+      },
+    };
+
+    const profileUser = await this.prisma.user.findUnique({
+      where: { id: userId },
+      select: {
+        role: true,
+        latitude: true,
+        longitude: true,
+        contentAreaKm: true,
+        pickupAreaKm: true,
+        deliveryAreaKm: true,
+      },
+    });
+    if (!profileUser) {
+      throw new NotFoundException('User not found');
+    }
+
+    let viewerRoleNorm = normalizeViewerRole(options?.viewerRole);
+    if (!options?.viewerRole && options?.viewerUserId) {
+      const viewer = await this.prisma.user.findUnique({
+        where: { id: options.viewerUserId },
+        select: { role: true },
+      });
+      viewerRoleNorm = normalizeViewerRole(viewer?.role);
+    }
+
+    if (!canViewerSeeCreatorContent(viewerRoleNorm, profileUser.role)) {
+      return empty;
+    }
+
+    // Direct profile lookup: do not blank the Videos tab based on content-area
+    // distance. Nearby discovery already enforces geo separately.
+
     const skip = (page - 1) * limit;
-    const isOwner = this.viewerIsChannelOwner(authHeader, userId);
     const now = new Date();
-    const scheduledFilter = isOwner
-      ? {}
-      : {
-          OR: [
-            { scheduledPublishAt: null },
-            { scheduledPublishAt: { lte: now } },
-          ],
-        };
+    const scheduledFilter = {
+      OR: [
+        { scheduledPublishAt: null },
+        { scheduledPublishAt: { lte: now } },
+      ],
+    };
 
     const [videos, total] = await Promise.all([
       this.prisma.video.findMany({

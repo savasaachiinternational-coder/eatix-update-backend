@@ -7,7 +7,6 @@ import {
   Body,
   Param,
   Query,
-  Headers,
   UseInterceptors,
   UploadedFiles,
   BadRequestException,
@@ -31,6 +30,7 @@ import {
   VideoCommentLikeDto,
   VideoCommentDislikeDto,
   VideoCommentDeleteDto,
+  VideoCommentUpdateDto,
   VideoViewDto,
 } from './dto/video.dto';
 
@@ -48,21 +48,17 @@ export class VideoController {
     @UploadedFiles() files: Express.Multer.File[],
     @Body() createVideoDto: CreateVideoDto,
   ) {
-    if (!files || files.length < 2) {
-      throw new BadRequestException(
-        'Both video and thumbnail files are required',
-      );
+    if (!files || files.length < 1) {
+      throw new BadRequestException('Video file is required');
     }
 
-    // Identify video and thumbnail files
     const videoFile = files.find((file) => file.mimetype.startsWith('video/'));
-    const thumbnailFile = files.find((file) =>
-      file.mimetype.startsWith('image/'),
-    );
+    const thumbnailFile =
+      files.find((file) => file.mimetype.startsWith('image/')) || null;
 
-    if (!videoFile || !thumbnailFile) {
+    if (!videoFile) {
       throw new BadRequestException(
-        'Invalid files. Please upload a video file and an image thumbnail',
+        'Invalid files. Please upload a video file (thumbnail is optional)',
       );
     }
 
@@ -201,6 +197,13 @@ export class VideoController {
     return this.videoService.deleteComment(dto);
   }
 
+  @Post('comment/update')
+  @ApiOperation({ summary: 'Edit own comment or reply' })
+  @ApiResponse({ status: 200, description: 'Comment updated' })
+  async updateComment(@Body() dto: VideoCommentUpdateDto) {
+    return this.videoService.updateComment(dto);
+  }
+
   @Post('view')
   @ApiOperation({ summary: 'Record video view' })
   @ApiResponse({ status: 201, description: 'View recorded successfully' })
@@ -218,13 +221,23 @@ export class VideoController {
     @Param('userId') userId: string,
     @Query('page') page?: number,
     @Query('limit') limit?: number,
-    @Headers('authorization') authorization?: string,
+    @Query('viewerRole') viewerRole?: string,
+    @Query('viewerUserId') viewerUserId?: string,
+    @Query('viewerLat') viewerLat?: string,
+    @Query('viewerLng') viewerLng?: string,
   ) {
+    const lat = viewerLat != null ? parseFloat(viewerLat) : undefined;
+    const lng = viewerLng != null ? parseFloat(viewerLng) : undefined;
     return this.videoService.getUserVideos(
       userId,
       page || 1,
       limit || 20,
-      authorization,
+      {
+        viewerRole,
+        viewerUserId,
+        viewerLat: Number.isFinite(lat!) ? lat : undefined,
+        viewerLng: Number.isFinite(lng!) ? lng : undefined,
+      },
     );
   }
 }

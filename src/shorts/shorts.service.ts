@@ -24,9 +24,23 @@ import {
   ShortCommentDto,
   ShortCommentLikeDto,
   ShortCommentDislikeDto,
+  ShortCommentUpdateDto,
   ShortViewDto,
 } from './dto/shorts.dto';
 import { ShortsTranscodeService } from './shorts-transcode.service';
+import {
+  extractVideoThumbnailFromPath,
+} from '../common/video-thumbnail.util';
+import { withNormalizedShortVideoUrl } from '../common/normalize-short-video-url.util';
+import { UK_DEFAULT_RADIUS_KM } from '../common/geo.util';
+import { resolveNearbyUserIds } from '../common/nearby-users.cache';
+import {
+  assertViewerCanSeeCreatorContent,
+  canViewerSeeCreatorContent,
+  creatorRoleWhereForViewer,
+  normalizeViewerRole,
+} from '../common/content-visibility.util';
+import { v4 as uuidv4 } from 'uuid';
 
 @Injectable()
 export class ShortsService {
@@ -40,6 +54,27 @@ export class ShortsService {
     private shortsTranscode: ShortsTranscodeService,
     private readonly scheduledContentService: ScheduledContentService,
   ) {}
+
+  private async uploadShortThumbnailFromVideoPath(
+    videoPath: string,
+  ): Promise<string | null> {
+    try {
+      const buf = await extractVideoThumbnailFromPath(videoPath);
+      const { url } = await this.r2Storage.uploadBuffer(
+        buf,
+        `${uuidv4()}.jpg`,
+        'image/jpeg',
+        'shorts/thumbnails',
+      );
+      this.logger.log('Auto-generated short thumbnail from video');
+      return url;
+    } catch (e: any) {
+      this.logger.warn(
+        `Short thumbnail auto-generation failed: ${e?.message || e}`,
+      );
+      return null;
+    }
+  }
 
   private static readonly AUTO_POST_PLATFORMS = [
     'facebook',
@@ -226,9 +261,12 @@ export class ShortsService {
       const videoUrl = uploaded.url;
 
       const thumbKey = dto.thumbnailKey ? String(dto.thumbnailKey).trim() : '';
-      const thumbnailUrl = thumbKey
+      let thumbnailUrl = thumbKey
         ? this.r2Storage.getPublicUrl(thumbKey)
         : null;
+      if (!thumbnailUrl && processedPath) {
+        thumbnailUrl = await this.uploadShortThumbnailFromVideoPath(processedPath);
+      }
 
       const normalizedTags = (() => {
         const base = Array.isArray(dto.tags) ? dto.tags : [];
@@ -304,6 +342,19 @@ export class ShortsService {
       try {
         await this.r2Storage.deleteFile(rawKey);
       } catch {}
+
+      if ((short.visibility || 'public') === 'public') {
+        const creatorName =
+          short.user?.nickname || short.user?.name || 'Someone';
+        this.notificationService
+          .notifySubscribersAndAreaUsers({
+            creatorUserId: short.userId,
+            message: `${creatorName} posted a new short: ${short.title || 'Untitled'}`,
+            type: 'short_new',
+            contentId: short.id,
+          })
+          .catch(() => null);
+      }
 
       return short;
     } catch (e: any) {
@@ -423,6 +474,10 @@ export class ShortsService {
             )
           : await this.r2Storage.uploadFile(thumbnailFile, 'shorts/thumbnails');
         thumbnailUrl = thumb.url;
+      } else if (videoUpload?.path) {
+        thumbnailUrl = await this.uploadShortThumbnailFromVideoPath(
+          videoUpload.path,
+        );
       }
 
       const normalizedTags = (() => {
@@ -505,6 +560,18 @@ export class ShortsService {
       });
 
       this.logger.log(`Short uploaded successfully: ${short.id}`);
+      if ((short.visibility || 'public') === 'public') {
+        const creatorName =
+          short.user?.nickname || short.user?.name || 'Someone';
+        this.notificationService
+          .notifySubscribersAndAreaUsers({
+            creatorUserId: short.userId,
+            message: `${creatorName} posted a new short: ${short.title || 'Untitled'}`,
+            type: 'short_new',
+            contentId: short.id,
+          })
+          .catch(() => null);
+      }
       return short;
     } catch (error: any) {
       this.logger.error(`Error uploading short: ${error.message}`);
@@ -691,6 +758,17 @@ export class ShortsService {
     return R * c;
   }
 
+  private publicShortPublishedWhere(now = new Date()) {
+    return {
+      OR: [{ publishedAt: null }, { publishedAt: { lte: now } }],
+    };
+  }
+
+  private isShortPublished(short: { publishedAt?: Date | string | null }) {
+    if (!short?.publishedAt) return true;
+    return new Date(short.publishedAt).getTime() <= Date.now();
+  }
+
   /**
    * Get shorts with pagination and filters
    */
@@ -706,7 +784,7 @@ export class ShortsService {
       sort,
       nearbyLat,
       nearbyLng,
-      radiusKm = 50,
+      radiusKm = UK_DEFAULT_RADIUS_KM,
       viewerRole,
     } = query;
     const skip = (page - 1) * limit;
@@ -714,42 +792,34 @@ export class ShortsService {
     const where: any = {
       status: 'ready',
       visibility: 'public',
-      OR: [{ publishedAt: null }, { publishedAt: { lte: new Date() } }],
+      AND: [this.publicShortPublishedWhere()],
     };
 
-    // When viewer role is "user": show only non-vendor uploads (owner, user, admin). When "vendor" or other: show all.
-    const viewerRoleNorm = (viewerRole || 'user').toLowerCase();
-    if (viewerRoleNorm === 'user') {
-      where.user = { role: { not: 'vendor' } };
+    const roleFilter = creatorRoleWhereForViewer(viewerRole);
+    if (roleFilter) {
+      where.user = roleFilter;
     }
 
     if (userId) where.userId = userId;
     if (nearbyLat != null && nearbyLng != null) {
-      const usersWithLocation = await this.prisma.user.findMany({
-        where: {
-          latitude: { not: null },
-          longitude: { not: null },
-        },
-        select: { id: true, latitude: true, longitude: true },
-      });
-      const nearbyUserIds = usersWithLocation
-        .filter(
-          (u) =>
-            u.latitude != null &&
-            u.longitude != null &&
-            this.haversineKm(nearbyLat, nearbyLng, u.latitude, u.longitude) <=
-              radiusKm,
-        )
-        .map((u) => u.id);
+      const nearbyUserIds = await resolveNearbyUserIds(
+        this.prisma,
+        nearbyLat,
+        nearbyLng,
+        radiusKm,
+        viewerRole,
+      );
       where.userId = { in: nearbyUserIds.length > 0 ? nearbyUserIds : [''] };
     }
     if (category) where.category = category;
     if (isLive !== undefined) where.isLive = isLive;
     if (search) {
-      where.OR = [
-        { title: { contains: search, mode: 'insensitive' } },
-        { description: { contains: search, mode: 'insensitive' } },
-      ];
+      where.AND.push({
+        OR: [
+          { title: { contains: search, mode: 'insensitive' } },
+          { description: { contains: search, mode: 'insensitive' } },
+        ],
+      });
     }
 
     const orderBy =
@@ -770,9 +840,7 @@ export class ShortsService {
               name: true,
               nickname: true,
               role: true,
-              email: true,
-              phone: true,
-              address: true,
+              photos: true,
               latitude: true,
               longitude: true,
             },
@@ -822,7 +890,7 @@ export class ShortsService {
     }
 
     return {
-      shorts: resultShorts,
+      shorts: resultShorts.map((s) => withNormalizedShortVideoUrl(s)),
       pagination: {
         total,
         page,
@@ -866,21 +934,17 @@ export class ShortsService {
     if (!short) throw new NotFoundException('Short not found');
     if (
       short.visibility === 'public' &&
-      short.visibility === 'public' &&
-      short.publishedAt &&
-      new Date(short.publishedAt).getTime() > Date.now()
+      !this.isShortPublished(short) &&
+      (!userId || String(short.userId) !== String(userId))
     ) {
       throw new NotFoundException('Short not found');
     }
 
-    // When viewer has role "user", do not allow viewing vendor-uploaded shorts
-    const viewerRoleNorm = (viewerRole || 'user').toLowerCase();
-    if (viewerRoleNorm === 'user') {
-      const uploaderRole = (short.user?.role || '').toLowerCase();
-      if (uploaderRole === 'vendor') {
-        throw new NotFoundException('Short not found');
-      }
-    }
+    assertViewerCanSeeCreatorContent(
+      viewerRole,
+      short.user?.role,
+      'Short not found',
+    );
 
     let isLiked = false;
     if (userId) {
@@ -998,7 +1062,7 @@ export class ShortsService {
       );
     }
 
-    return response;
+    return withNormalizedShortVideoUrl(response);
   }
 
   /**
@@ -1253,6 +1317,39 @@ export class ShortsService {
   }
 
   /**
+   * Edit own comment or reply
+   */
+  async updateComment(dto: ShortCommentUpdateDto) {
+    const { commentId, userId, content } = dto;
+    const trimmed = String(content || '').trim();
+    if (!trimmed) {
+      throw new BadRequestException('Comment content is required');
+    }
+
+    const comment = await this.prisma.shortComment.findUnique({
+      where: { id: commentId },
+    });
+    if (!comment) throw new NotFoundException('Comment not found');
+    if (comment.userId !== userId) {
+      throw new BadRequestException('You can only edit your own comments');
+    }
+
+    return this.prisma.shortComment.update({
+      where: { id: commentId },
+      data: { content: trimmed },
+      include: {
+        user: {
+          select: {
+            id: true,
+            name: true,
+            nickname: true,
+          },
+        },
+      },
+    });
+  }
+
+  /**
    * Get comments
    */
   async getComments(shortId: string, page = 1, limit = 20, userId?: string) {
@@ -1479,7 +1576,8 @@ export class ShortsService {
         (v) =>
           v.short &&
           v.short.status !== 'deleted' &&
-          v.short.visibility === 'public',
+          v.short.visibility === 'public' &&
+          this.isShortPublished(v.short),
       )
       .map((v) => ({ short: v.short, watchedAt: v.createdAt }));
     return {
@@ -1515,7 +1613,8 @@ export class ShortsService {
         (l) =>
           l.short &&
           l.short.status !== 'deleted' &&
-          l.short.visibility === 'public',
+          l.short.visibility === 'public' &&
+          this.isShortPublished(l.short),
       )
       .map((l) => l.short);
     return {
@@ -1532,13 +1631,62 @@ export class ShortsService {
     page = 1,
     limit = 20,
     viewerUserId?: string,
+    options?: {
+      viewerRole?: string;
+      viewerLat?: number;
+      viewerLng?: number;
+    },
   ) {
+    const empty = {
+      shorts: [],
+      pagination: { total: 0, page, limit, totalPages: 0 },
+    };
+
+    const profileUser = await this.prisma.user.findUnique({
+      where: { id: userId },
+      select: {
+        role: true,
+        latitude: true,
+        longitude: true,
+        contentAreaKm: true,
+        pickupAreaKm: true,
+        deliveryAreaKm: true,
+      },
+    });
+    if (!profileUser) {
+      throw new NotFoundException('User not found');
+    }
+
+    let viewerRoleNorm = normalizeViewerRole(options?.viewerRole);
+    if (!options?.viewerRole && viewerUserId) {
+      const viewer = await this.prisma.user.findUnique({
+        where: { id: viewerUserId },
+        select: { role: true },
+      });
+      viewerRoleNorm = normalizeViewerRole(viewer?.role);
+    }
+
+    if (!canViewerSeeCreatorContent(viewerRoleNorm, profileUser.role)) {
+      return empty;
+    }
+
+    // Direct profile lookup (`/shorts/user/:userId`): show public content for this
+    // channel regardless of content-area distance. Geo radius applies to nearby /
+    // discovery feeds only — otherwise you can open a restaurant from Shorts and
+    // see an empty Gallery/Videos tab when browsing from another city.
+
     const skip = (page - 1) * limit;
+    const viewingOwnShorts =
+      !!viewerUserId && String(viewerUserId) === String(userId);
+    const scheduleVisibilityFilter = viewingOwnShorts
+      ? {}
+      : this.publicShortPublishedWhere();
     const [shorts, total] = await Promise.all([
       this.prisma.short.findMany({
         where: {
           userId,
           status: { not: 'deleted' },
+          ...scheduleVisibilityFilter,
         },
         skip,
         take: limit,
@@ -1565,6 +1713,7 @@ export class ShortsService {
         where: {
           userId,
           status: { not: 'deleted' },
+          ...scheduleVisibilityFilter,
         },
       }),
     ]);
@@ -1599,7 +1748,7 @@ export class ShortsService {
     }
 
     return {
-      shorts: resultShorts,
+      shorts: resultShorts.map((s) => withNormalizedShortVideoUrl(s)),
       pagination: {
         total,
         page,

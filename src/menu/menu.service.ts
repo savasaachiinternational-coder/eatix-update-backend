@@ -10,6 +10,15 @@ import { CreateMenuItemDto } from './dto/create-menu-item.dto';
 import { UpdateMenuItemDto } from './dto/update-menu-item.dto';
 import { CreateMenuCategoryDto } from './dto/create-menu-category.dto';
 import { UpdateMenuCategoryDto } from './dto/update-menu-category.dto';
+import {
+  menuItemMatchesCategory,
+  resolveDiscoveryCategory,
+} from './menu-discovery.constants';
+import {
+  haversineKm,
+  isValidCoord,
+  UK_DEFAULT_RADIUS_KM,
+} from '../common/geo.util';
 
 @Injectable()
 export class MenuService {
@@ -272,6 +281,7 @@ export class MenuService {
           ? dto.allergenIconUrls.map((a) => String(a).trim()).filter(Boolean)
           : [],
       },
+      include: { category: true },
     });
   }
 
@@ -328,6 +338,7 @@ export class MenuService {
     return this.prisma.menuItem.update({
       where: { id },
       data: data as any,
+      include: { category: true },
     });
   }
 
@@ -556,4 +567,270 @@ export class MenuService {
     await this.prisma.menuFile.delete({ where: { id } });
     return { deleted: true };
   }
+
+  /**
+   * Public Foodpanda-style browse: restaurants whose menu matches a category.
+   * Media priority: short/video thumbnail → owner photo → matching menu item image.
+   */
+  async browseByCategory(
+    category: string,
+    page = 1,
+    limit = 20,
+    opts?: { nearbyLat?: number; nearbyLng?: number; radiusKm?: number },
+  ) {
+    const filter = String(category || '').trim();
+    if (!filter) {
+      return { restaurants: [], page, limit, total: 0 };
+    }
+
+    const safePage = Math.max(1, Number(page) || 1);
+    const safeLimit = Math.min(100, Math.max(1, Number(limit) || 20));
+
+    const items = await this.prisma.menuItem.findMany({
+      where: {
+        user: {
+          role: { in: ['owner', 'vendor'] },
+        },
+      },
+      include: {
+        category: true,
+        user: {
+          select: {
+            id: true,
+            name: true,
+            nickname: true,
+            address: true,
+            postcode: true,
+            latitude: true,
+            longitude: true,
+            photos: true,
+            role: true,
+          },
+        },
+      },
+      orderBy: [{ sortOrder: 'asc' }, { createdAt: 'asc' }],
+    });
+
+    type OwnerAgg = {
+      owner: (typeof items)[0]['user'];
+      matchingItems: typeof items;
+    };
+    const byOwner = new Map<string, OwnerAgg>();
+
+    for (const item of items) {
+      if (!item.userId || !item.user) continue;
+      if (!menuItemMatchesCategory(item, filter)) continue;
+      const oid = String(item.userId);
+      if (!byOwner.has(oid)) {
+        byOwner.set(oid, { owner: item.user, matchingItems: [] });
+      }
+      byOwner.get(oid)!.matchingItems.push(item);
+    }
+
+    let ownerIds = getOwnerIdsSorted(byOwner);
+
+    const nearbyLat = opts?.nearbyLat;
+    const nearbyLng = opts?.nearbyLng;
+    const radiusKm = opts?.radiusKm ?? UK_DEFAULT_RADIUS_KM;
+    if (isValidCoord(nearbyLat) && isValidCoord(nearbyLng)) {
+      const withDistance = ownerIds
+        .map((oid) => {
+          const owner = byOwner.get(oid)?.owner;
+          if (
+            owner?.latitude == null ||
+            owner?.longitude == null
+          ) {
+            return null;
+          }
+          const distanceKm = haversineKm(
+            nearbyLat!,
+            nearbyLng!,
+            owner.latitude,
+            owner.longitude,
+          );
+          return { oid, distanceKm };
+        })
+        .filter(
+          (x): x is { oid: string; distanceKm: number } =>
+            x != null && x.distanceKm <= radiusKm,
+        )
+        .sort((a, b) => a.distanceKm - b.distanceKm);
+      ownerIds = withDistance.map((x) => x.oid);
+    }
+
+    const total = ownerIds.length;
+    const pageIds = ownerIds.slice(
+      (safePage - 1) * safeLimit,
+      safePage * safeLimit,
+    );
+
+    if (pageIds.length === 0) {
+      return { restaurants: [], page: safePage, limit: safeLimit, total };
+    }
+
+    const [orderAgg, shorts, videos, reviewAgg] = await Promise.all([
+      this.prisma.restaurantOrder.groupBy({
+        by: ['ownerId'],
+        where: { ownerId: { in: pageIds }, status: { not: 'cancelled' } },
+        _count: { _all: true },
+      }),
+      this.prisma.short.findMany({
+        where: {
+          userId: { in: pageIds },
+          visibility: 'public',
+          status: 'ready',
+          OR: [{ publishedAt: null }, { publishedAt: { lte: new Date() } }],
+        },
+        orderBy: [{ viewCount: 'desc' }, { createdAt: 'desc' }],
+        select: {
+          id: true,
+          userId: true,
+          videoUrl: true,
+          thumbnailUrl: true,
+          coverUrl: true,
+          viewCount: true,
+        },
+      }),
+      this.prisma.video.findMany({
+        where: {
+          userId: { in: pageIds },
+          visibility: 'public',
+          status: 'ready',
+          OR: [
+            { scheduledPublishAt: null },
+            { scheduledPublishAt: { lte: new Date() } },
+          ],
+        },
+        orderBy: [{ viewCount: 'desc' }, { createdAt: 'desc' }],
+        select: {
+          id: true,
+          userId: true,
+          videoUrl: true,
+          thumbnailUrl: true,
+          viewCount: true,
+        },
+      }),
+      this.prisma.restaurantOrderReview.groupBy({
+        by: ['ownerId'],
+        where: { ownerId: { in: pageIds } },
+        _avg: { rating: true },
+        _count: { _all: true },
+      }),
+    ]);
+
+    const orderCountMap = new Map(
+      orderAgg.map((r) => [String(r.ownerId), r._count._all]),
+    );
+    const reviewMap = new Map(
+      reviewAgg.map((r) => [
+        String(r.ownerId),
+        {
+          rating: r._avg.rating ?? 0,
+          count: r._count._all,
+        },
+      ]),
+    );
+    const shortByOwner = pickFirstMediaByOwner(shorts);
+    const videoByOwner = pickFirstMediaByOwner(videos);
+
+    const discovery = resolveDiscoveryCategory(filter);
+    const categoryLabel = discovery?.label || filter;
+
+    const restaurants = pageIds.map((oid) => {
+      const agg = byOwner.get(oid)!;
+      const owner = agg.owner;
+      const matchingItems = agg.matchingItems;
+      const short = shortByOwner.get(oid);
+      const video = videoByOwner.get(oid);
+      const review = reviewMap.get(oid) || { rating: 0, count: 0 };
+
+      const ownerPhoto = readOwnerPhoto(owner.photos);
+      const menuImage =
+        matchingItems.find((m) => m.imageUrl)?.imageUrl || null;
+
+      let mediaType: 'short' | 'video' | 'image' = 'image';
+      let mediaId = '';
+      let mediaUrl = '';
+      let mediaThumb = ownerPhoto || menuImage || '';
+
+      if (short?.videoUrl) {
+        mediaType = 'short';
+        mediaId = short.id;
+        mediaUrl = short.videoUrl;
+        mediaThumb =
+          short.thumbnailUrl || short.coverUrl || mediaThumb;
+      } else if (video?.videoUrl) {
+        mediaType = 'video';
+        mediaId = video.id;
+        mediaUrl = video.videoUrl;
+        mediaThumb = video.thumbnailUrl || mediaThumb;
+      } else if (menuImage) {
+        mediaThumb = menuImage;
+      }
+
+      const totalViews =
+        Number(short?.viewCount || 0) + Number(video?.viewCount || 0);
+
+      return {
+        id: oid,
+        name: owner.nickname || owner.name || 'Restaurant',
+        address: owner.address || 'Near you',
+        postcode: owner.postcode || null,
+        latitude: owner.latitude ?? null,
+        longitude: owner.longitude ?? null,
+        role: owner.role || 'owner',
+        orderCount: orderCountMap.get(oid) || 0,
+        rating: Math.round((review.rating || 0) * 10) / 10,
+        reviewCount: review.count,
+        mediaType,
+        mediaId,
+        mediaUrl,
+        mediaThumb,
+        totalViews,
+        categoryLabel,
+        matchingItemCount: matchingItems.length,
+        matchingItems: matchingItems.slice(0, 6).map((m) => ({
+          id: m.id,
+          itemName: m.itemName,
+          price: m.price,
+          imageUrl: m.imageUrl,
+          categoryName: m.category?.name || null,
+        })),
+      };
+    });
+
+    return {
+      restaurants,
+      page: safePage,
+      limit: safeLimit,
+      total,
+      category: discovery?.key || filter.toLowerCase(),
+      categoryLabel,
+    };
+  }
+}
+
+function getOwnerIdsSorted(byOwner: Map<string, { matchingItems: { id: string }[]; owner: { id: string } }>) {
+  return Array.from(byOwner.entries())
+    .sort((a, b) => b[1].matchingItems.length - a[1].matchingItems.length)
+    .map(([id]) => id);
+}
+
+function pickFirstMediaByOwner<T extends { userId: string }>(rows: T[]) {
+  const map = new Map<string, T>();
+  for (const row of rows) {
+    const id = String(row.userId);
+    if (!map.has(id)) map.set(id, row);
+  }
+  return map;
+}
+
+function readOwnerPhoto(photos: unknown): string {
+  if (!Array.isArray(photos) || photos.length === 0) return '';
+  const first = photos[0];
+  if (typeof first === 'string') return first.trim();
+  if (first && typeof first === 'object' && 'src' in first) {
+    return String((first as { src?: string }).src || '').trim();
+  }
+  return '';
 }

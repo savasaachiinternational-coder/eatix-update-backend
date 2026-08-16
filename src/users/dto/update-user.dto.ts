@@ -6,6 +6,8 @@ import {
   IsEmail,
   IsArray,
   IsNumber,
+  Min,
+  IsInt,
   ValidateNested,
 } from 'class-validator';
 import { UserStatus, Gender } from '@prisma/client';
@@ -104,6 +106,11 @@ export class UpdateUserDto {
   @IsNumber()
   longitude?: number;
 
+  @ApiPropertyOptional({ description: 'UK postcode e.g. WD5 0AB' })
+  @IsOptional()
+  @IsString()
+  postcode?: string;
+
   @ApiProperty({ description: 'The phone number of the user', required: false })
   @IsOptional()
   @IsString()
@@ -195,4 +202,81 @@ export class UpdateUserDto {
   @ValidateNested({ each: true })
   @Type(() => OpeningHourDto)
   openingHours?: OpeningHourDto[];
+
+  @ApiPropertyOptional({
+    description: 'Owner estimated delivery time label e.g. "30-45 minutes"',
+  })
+  @IsOptional()
+  @IsString()
+  deliveryTime?: string;
+
+  @ApiPropertyOptional({
+    description:
+      'Owner max browse/content radius from shop (videos, shorts, posts) (km)',
+  })
+  @IsOptional()
+  @Type(() => Number)
+  @IsNumber()
+  contentAreaKm?: number;
+
+  @ApiPropertyOptional({
+    description: 'Owner max pickup/collection radius from shop (km)',
+  })
+  @IsOptional()
+  @Type(() => Number)
+  @IsNumber()
+  pickupAreaKm?: number;
+
+  @ApiPropertyOptional({
+    description: 'Owner max delivery radius from restaurant location (km)',
+  })
+  @IsOptional()
+  @Type(() => Number)
+  @IsNumber()
+  deliveryAreaKm?: number;
+
+  @ApiPropertyOptional({
+    description: 'Delivery tax/charge (£) for customers 0-10 km away',
+  })
+  @IsOptional()
+  @Type(() => Number)
+  @IsNumber()
+  @Min(0)
+  taxCharge0To10Km?: number;
+
+  @ApiPropertyOptional({
+    description: 'Delivery tax/charge (£) for customers 11-20 km away',
+  })
+  @IsOptional()
+  @Type(() => Number)
+  @IsNumber()
+  @Min(0)
+  taxCharge11To20Km?: number;
+
+  @ApiPropertyOptional({
+    description: 'Delivery tax/charge (£) for customers 21-30 km away',
+  })
+  @IsOptional()
+  @Type(() => Number)
+  @IsNumber()
+  @Min(0)
+  taxCharge21To30Km?: number;
+
+  @ApiPropertyOptional({
+    description: 'Vendor-only: minimum quantity per menu line item when ordering',
+  })
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  vendorMinOrderQty?: number | null;
+
+  @ApiPropertyOptional({
+    description: 'Vendor-only: maximum quantity per menu line item when ordering',
+  })
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  vendorMaxOrderQty?: number | null;
 }

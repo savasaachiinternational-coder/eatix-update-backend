@@ -14,6 +14,7 @@ import {
   UploadedFile,
   BadRequestException,
   Req,
+  Headers,
 } from '@nestjs/common';
 import { FileInterceptor, FilesInterceptor } from '@nestjs/platform-express';
 import {
@@ -33,6 +34,7 @@ import {
   ForgotPasswordDto,
   VerifyOtpDto,
   ResetPasswordDto,
+  ReactivateAccountDto,
 } from './dto/forgot-password.dto';
 import {
   SetPinDto,
@@ -42,6 +44,9 @@ import {
 } from './dto/set-pin.dto';
 import { ChangePasswordDto } from './dto/change-password.dto';
 import { SavedLastLocationDto } from './dto/saved-last-location.dto';
+import { SocialLoginDto } from './dto/social-login.dto';
+import { PhoneLoginDto } from './dto/phone-login.dto';
+import { BlockUserDto } from './dto/user-safety.dto';
 import Roles from '../auth/roles.decorator';
 import RolesGuard from '../auth/roles.guard';
 import { Product } from '@prisma/client';
@@ -111,6 +116,86 @@ export class UsersController {
   @ApiResponse({ status: 401, description: 'Unauthorized.' })
   async loginUser(@Body() loginUserDto: LoginUserDto) {
     return this.usersService.loginUser(loginUserDto);
+  }
+
+  @Post('refresh-session')
+  @ApiOperation({
+    summary:
+      'Refresh auth token for a logged-in user (accepts expired JWT with valid signature)',
+  })
+  @ApiResponse({ status: 200, description: 'Session refreshed successfully.' })
+  @ApiResponse({ status: 401, description: 'Invalid session.' })
+  async refreshSession(@Headers('authorization') authorization?: string) {
+    return this.usersService.refreshSession(authorization);
+  }
+
+  @Post('social-login')
+  @ApiOperation({ summary: 'Login/register using Google or Facebook token' })
+  @ApiResponse({ status: 200, description: 'Social login successful.' })
+  @ApiResponse({ status: 400, description: 'Invalid provider token.' })
+  async socialLogin(@Body() dto: SocialLoginDto) {
+    return this.usersService.socialLogin(dto);
+  }
+
+  @Post('phone-login')
+  @ApiOperation({ summary: 'Login/register using Firebase phone OTP' })
+  @ApiResponse({ status: 200, description: 'Phone login successful.' })
+  async phoneLogin(@Body() dto: PhoneLoginDto) {
+    return this.usersService.phoneLogin(dto);
+  }
+
+  @Delete('me/account')
+  @UseGuards(JwtAuthGuard)
+  @ApiBearerAuth()
+  @ApiOperation({ summary: 'Permanently delete the logged-in user account' })
+  async deleteMyAccount(@Req() req: { user?: { id: string } }) {
+    if (!req.user?.id) {
+      throw new BadRequestException('Unauthorized');
+    }
+    return this.usersService.deleteOwnAccount(req.user.id);
+  }
+
+  @Get('blocks/ids')
+  @UseGuards(JwtAuthGuard)
+  @ApiBearerAuth()
+  @ApiOperation({ summary: 'List user ids blocked by the current user' })
+  async getBlockedUserIds(@Req() req: { user?: { id: string } }) {
+    if (!req.user?.id) {
+      throw new BadRequestException('Unauthorized');
+    }
+    return this.usersService.getBlockedUserIds(req.user.id);
+  }
+
+  @Post('blocks')
+  @UseGuards(JwtAuthGuard)
+  @ApiBearerAuth()
+  @ApiOperation({ summary: 'Block an abusive user' })
+  async blockUser(
+    @Body() dto: BlockUserDto,
+    @Req() req: { user?: { id: string } },
+  ) {
+    if (!req.user?.id) {
+      throw new BadRequestException('Unauthorized');
+    }
+    return this.usersService.blockUser(
+      req.user.id,
+      dto.blockedUserId,
+      dto.reason,
+    );
+  }
+
+  @Delete('blocks/:blockedUserId')
+  @UseGuards(JwtAuthGuard)
+  @ApiBearerAuth()
+  @ApiOperation({ summary: 'Unblock a user' })
+  async unblockUser(
+    @Param('blockedUserId') blockedUserId: string,
+    @Req() req: { user?: { id: string } },
+  ) {
+    if (!req.user?.id) {
+      throw new BadRequestException('Unauthorized');
+    }
+    return this.usersService.unblockUser(req.user.id, blockedUserId);
   }
 
   @Post('login/admin')
@@ -277,6 +362,98 @@ export class UsersController {
       currentUserId,
       page || 1,
       limit || 50,
+    );
+  }
+
+  @Get(':id/delivery-area-users')
+  @UseGuards(JwtAuthGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary:
+      'List logged-in customers within the owner delivery area (owner only)',
+  })
+  @ApiResponse({ status: 200, description: 'Delivery area users retrieved.' })
+  @ApiResponse({ status: 403, description: 'Forbidden.' })
+  async getDeliveryAreaUsers(
+    @Param('id') id: string,
+    @Req() req: { user?: { id: string } },
+    @Query('page') page?: number,
+    @Query('limit') limit?: number,
+  ) {
+    if (!req.user?.id) {
+      throw new BadRequestException('Authentication required');
+    }
+    return this.usersService.getDeliveryAreaUsers(
+      id,
+      req.user.id,
+      page || 1,
+      limit || 50,
+    );
+  }
+
+  @Post(':id/riders')
+  @UseGuards(JwtAuthGuard)
+  @ApiBearerAuth()
+  @ApiOperation({ summary: 'Create a rider account for this restaurant (owner only)' })
+  async createOwnerRider(
+    @Param('id') id: string,
+    @Req() req: { user?: { id: string } },
+    @Body() dto: import('./dto/create-rider.dto').CreateRiderDto,
+  ) {
+    if (!req.user?.id) throw new BadRequestException('Authentication required');
+    return this.usersService.createOwnerRider(id, req.user.id, dto);
+  }
+
+  @Get(':id/riders')
+  @UseGuards(JwtAuthGuard)
+  @ApiBearerAuth()
+  @ApiOperation({ summary: 'List riders for this restaurant (owner only)' })
+  async listOwnerRiders(
+    @Param('id') id: string,
+    @Req() req: { user?: { id: string } },
+  ) {
+    if (!req.user?.id) throw new BadRequestException('Authentication required');
+    return this.usersService.listOwnerRiders(id, req.user.id);
+  }
+
+  @Get(':ownerId/riders/:riderId')
+  @UseGuards(JwtAuthGuard)
+  @ApiBearerAuth()
+  @ApiOperation({ summary: 'Rider profile and assigned orders (owner only)' })
+  async getOwnerRiderProfile(
+    @Param('ownerId') ownerId: string,
+    @Param('riderId') riderId: string,
+    @Req() req: { user?: { id: string } },
+  ) {
+    if (!req.user?.id) throw new BadRequestException('Authentication required');
+    return this.usersService.getOwnerRiderProfile(ownerId, riderId, req.user.id);
+  }
+
+  @Post(':ownerId/riders/:riderId/upload-avatar')
+  @UseGuards(JwtAuthGuard)
+  @UseInterceptors(FileInterceptor('file'))
+  @ApiBearerAuth()
+  @ApiConsumes('multipart/form-data')
+  @ApiBody({
+    schema: {
+      type: 'object',
+      properties: { file: { type: 'string', format: 'binary' } },
+      required: ['file'],
+    },
+  })
+  @ApiOperation({ summary: 'Upload rider profile photo (owner only)' })
+  async uploadOwnerRiderAvatar(
+    @Param('ownerId') ownerId: string,
+    @Param('riderId') riderId: string,
+    @UploadedFile() file: Express.Multer.File,
+    @Req() req: { user?: { id: string } },
+  ) {
+    if (!req.user?.id) throw new BadRequestException('Authentication required');
+    return this.usersService.uploadOwnerRiderAvatar(
+      ownerId,
+      riderId,
+      req.user.id,
+      file,
     );
   }
 
@@ -598,6 +775,14 @@ export class UsersController {
   @ApiResponse({ status: 400, description: 'Invalid request.' })
   async resetPassword(@Body() resetPasswordDto: ResetPasswordDto) {
     return this.usersService.resetPassword(resetPasswordDto);
+  }
+
+  @Post('reactivate-account')
+  @ApiOperation({ summary: 'Reactivate blocked/deactive account after OTP verification' })
+  @ApiResponse({ status: 200, description: 'Account reactivated successfully.' })
+  @ApiResponse({ status: 400, description: 'Invalid request.' })
+  async reactivateAccount(@Body() reactivateDto: ReactivateAccountDto) {
+    return this.usersService.reactivateAccount(reactivateDto);
   }
 
   @Post('set-pin')

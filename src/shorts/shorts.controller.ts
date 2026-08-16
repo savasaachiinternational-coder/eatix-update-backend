@@ -32,6 +32,7 @@ import {
   ShortCommentDto,
   ShortCommentLikeDto,
   ShortCommentDislikeDto,
+  ShortCommentUpdateDto,
   ShortViewDto,
 } from './dto/shorts.dto';
 
@@ -184,8 +185,17 @@ export class ShortsController {
     @Query('page') page?: number,
     @Query('limit') limit?: number,
     @Query('viewerUserId') viewerUserId?: string,
+    @Query('viewerRole') viewerRole?: string,
+    @Query('viewerLat') viewerLat?: string,
+    @Query('viewerLng') viewerLng?: string,
   ) {
-    return this.shortsService.getUserShorts(userId, page, limit, viewerUserId);
+    const lat = viewerLat != null ? parseFloat(viewerLat) : undefined;
+    const lng = viewerLng != null ? parseFloat(viewerLng) : undefined;
+    return this.shortsService.getUserShorts(userId, page, limit, viewerUserId, {
+      viewerRole,
+      viewerLat: Number.isFinite(lat!) ? lat : undefined,
+      viewerLng: Number.isFinite(lng!) ? lng : undefined,
+    });
   }
 
   @Get(':id')
@@ -251,6 +261,13 @@ export class ShortsController {
   @ApiResponse({ status: 200, description: 'Comment dislike toggled' })
   async toggleCommentDislike(@Body() dto: ShortCommentDislikeDto) {
     return this.shortsService.toggleCommentDislike(dto);
+  }
+
+  @Post('comment/update')
+  @ApiOperation({ summary: 'Edit own short comment or reply' })
+  @ApiResponse({ status: 200, description: 'Comment updated' })
+  async updateComment(@Body() dto: ShortCommentUpdateDto) {
+    return this.shortsService.updateComment(dto);
   }
 
   @Get(':id/comments')

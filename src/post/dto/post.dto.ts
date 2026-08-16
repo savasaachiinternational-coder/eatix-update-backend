@@ -204,6 +204,16 @@ export class PostQueryDto {
   @IsOptional()
   @IsString()
   viewerUserId?: string;
+
+  @ApiPropertyOptional({ description: 'Viewer latitude for profile area checks' })
+  @IsOptional()
+  @Type(() => Number)
+  viewerLat?: number;
+
+  @ApiPropertyOptional({ description: 'Viewer longitude for profile area checks' })
+  @IsOptional()
+  @Type(() => Number)
+  viewerLng?: number;
 }
 
 export class PostLikeDto {
@@ -240,4 +250,10 @@ export class PostCommentDislikeDto {
 export class PostCommentDeleteDto {
   @ApiProperty() @IsNotEmpty() @IsString() commentId: string;
   @ApiProperty() @IsNotEmpty() @IsString() userId: string;
+}
+
+export class PostCommentUpdateDto {
+  @ApiProperty() @IsNotEmpty() @IsString() commentId: string;
+  @ApiProperty() @IsNotEmpty() @IsString() userId: string;
+  @ApiProperty() @IsNotEmpty() @IsString() content: string;
 }
