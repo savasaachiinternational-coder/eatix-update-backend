@@ -16,6 +16,9 @@ import { UpdatePromotionDto } from './dto/update-promotion.dto';
 import { resolveOwnerAreaKm } from '../common/geo.util';
 import {
   parsePromotionTiers,
+  parseScheduleSlots,
+  normalizeHhMm,
+  hhMmToMinutes,
   type DiscountTier,
 } from './promotion-discount.util';
 
@@ -33,12 +36,7 @@ export class PromotionService {
   /**
    * Get promotions by owner userId (public for profile view).
    */
-  async getByUserId(
-    userId: string,
-    page = 1,
-    limit = 50,
-    offerType?: string,
-  ) {
+  async getByUserId(userId: string, page = 1, limit = 50, offerType?: string) {
     if (!userId) {
       return {
         promotions: [],
@@ -49,7 +47,9 @@ export class PromotionService {
     const where: { userId: string; offerType?: string } = { userId };
     if (
       offerType &&
-      ['order', 'amount_discount', 'booking_discount'].includes(offerType)
+      ['order', 'amount_discount', 'booking_discount', 'both'].includes(
+        offerType,
+      )
     ) {
       where.offerType = offerType;
     }
@@ -100,15 +100,69 @@ export class PromotionService {
     return R * c;
   }
 
+  private parseJsonValue(raw: unknown): unknown {
+    if (typeof raw !== 'string') return raw;
+    const trimmed = raw.trim();
+    if (!trimmed) return undefined;
+    try {
+      return JSON.parse(trimmed);
+    } catch {
+      return raw;
+    }
+  }
+
+  private validateSchedule(
+    startTime?: string,
+    endTime?: string,
+    scheduleSlotsRaw?: unknown,
+  ) {
+    const start = startTime ? normalizeHhMm(startTime) : null;
+    const end = endTime ? normalizeHhMm(endTime) : null;
+    if (startTime && !start) {
+      throw new BadRequestException('Start time must be HH:mm (e.g. 14:00).');
+    }
+    if (endTime && !end) {
+      throw new BadRequestException('End time must be HH:mm (e.g. 15:00).');
+    }
+    if (start && end) {
+      const startMin = hhMmToMinutes(start);
+      const endMin = hhMmToMinutes(end);
+      if (startMin != null && endMin != null && endMin <= startMin) {
+        throw new BadRequestException('End time must be after start time.');
+      }
+    }
+    const slots = parseScheduleSlots(scheduleSlotsRaw);
+    if (
+      Array.isArray(scheduleSlotsRaw) &&
+      scheduleSlotsRaw.length &&
+      slots.length !== scheduleSlotsRaw.length
+    ) {
+      throw new BadRequestException(
+        'Each day/time slot needs a weekday and a valid start–end time (end after start).',
+      );
+    }
+    return {
+      startTime: start ?? undefined,
+      endTime: end ?? undefined,
+      scheduleSlots: slots,
+    };
+  }
+
   private validateTierPromotion(
     offerType: string,
     tiers: DiscountTier[],
     fulfillmentScopes?: string[],
     tierMetricType?: string,
   ) {
-    if (offerType === 'amount_discount' || offerType === 'booking_discount') {
+    if (
+      offerType === 'amount_discount' ||
+      offerType === 'booking_discount' ||
+      offerType === 'both'
+    ) {
       if (!tiers.length) {
-        throw new BadRequestException('At least one discount tier is required.');
+        throw new BadRequestException(
+          'At least one discount tier is required.',
+        );
       }
       for (const tier of tiers) {
         if (tier.maxValue != null && tier.maxValue < tier.minValue) {
@@ -118,7 +172,7 @@ export class PromotionService {
         }
       }
     }
-    if (offerType === 'amount_discount') {
+    if (offerType === 'amount_discount' || offerType === 'both') {
       if (!fulfillmentScopes?.length) {
         throw new BadRequestException(
           'Select at least one fulfillment scope: collection, delivery, or both.',
@@ -131,6 +185,15 @@ export class PromotionService {
           'Booking discount requires tierMetricType: people or amount.',
         );
       }
+    }
+    if (
+      offerType === 'both' &&
+      tierMetricType &&
+      !['people', 'amount'].includes(tierMetricType)
+    ) {
+      throw new BadRequestException(
+        'Both discount requires tierMetricType: people or amount.',
+      );
     }
   }
 
@@ -148,13 +211,19 @@ export class PromotionService {
     if (expireDate <= startDate) {
       throw new BadRequestException('Expire date must be after start date.');
     }
-    if (offerType === 'order') {
+    if (offerType === 'order' || offerType === 'both') {
       if (dto.promoAmount == null || !dto.promoCode?.trim()) {
         throw new BadRequestException(
-          'Order promotions require promoAmount and promoCode.',
+          'Order and Both promotions require promoAmount and promoCode.',
         );
       }
     }
+    const schedule = this.validateSchedule(
+      dto.startTime,
+      dto.endTime,
+      this.parseJsonValue(dto.scheduleSlots),
+    );
+    const usesPromoCode = offerType === 'order' || offerType === 'both';
     return {
       userId: dto.userId,
       title: dto.title,
@@ -163,17 +232,22 @@ export class PromotionService {
       videoUrl: dto.videoUrl ?? undefined,
       mediaType: (dto.mediaType as 'image' | 'video') || 'image',
       duration: dto.duration ?? undefined,
-      promoAmount: offerType === 'order' ? Number(dto.promoAmount) : 0,
-      promoCode: offerType === 'order' ? dto.promoCode!.trim() : '',
+      promoAmount: usesPromoCode ? Number(dto.promoAmount) : 0,
+      promoCode: usesPromoCode ? dto.promoCode!.trim() : '',
       offerType,
       fulfillmentScopes: Array.isArray(dto.fulfillmentScopes)
         ? dto.fulfillmentScopes
         : [],
       discountTiers: tiers.length ? tiers : undefined,
       tierMetricType:
-        offerType === 'booking_discount' ? dto.tierMetricType : undefined,
+        offerType === 'booking_discount' || offerType === 'both'
+          ? dto.tierMetricType || 'amount'
+          : undefined,
       startDate,
       expireDate,
+      startTime: schedule.startTime ?? null,
+      endTime: schedule.endTime ?? null,
+      scheduleSlots: schedule.scheduleSlots,
       menuItemIds: Array.isArray(dto.menuItemIds) ? dto.menuItemIds : [],
     };
   }
@@ -351,6 +425,9 @@ export class PromotionService {
       fulfillmentScopes?: string[] | string;
       discountTiers?: string | unknown;
       tierMetricType?: string;
+      startTime?: string;
+      endTime?: string;
+      scheduleSlots?: string | unknown;
     },
     requestUserId: string,
   ) {
@@ -379,20 +456,16 @@ export class PromotionService {
         'Invalid files. Please upload an image or a video.',
       );
     }
-    if (
-      !body.title?.trim() ||
-      !body.startDate ||
-      !body.expireDate
-    ) {
+    if (!body.title?.trim() || !body.startDate || !body.expireDate) {
       throw new BadRequestException(
         'title, startDate and expireDate are required.',
       );
     }
     const offerType = body.offerType || 'order';
-    if (offerType === 'order') {
+    if (offerType === 'order' || offerType === 'both') {
       if (body.promoAmount == null || !body.promoCode?.trim()) {
         throw new BadRequestException(
-          'Order promotions require promoAmount and promoCode.',
+          'Order and Both promotions require promoAmount and promoCode.',
         );
       }
     }
@@ -457,6 +530,12 @@ export class PromotionService {
       fulfillmentScopes,
       body.tierMetricType,
     );
+    const schedule = this.validateSchedule(
+      body.startTime,
+      body.endTime,
+      this.parseJsonValue(body.scheduleSlots),
+    );
+    const usesPromoCode = offerType === 'order' || offerType === 'both';
     const duration =
       typeof body.duration === 'number'
         ? body.duration
@@ -490,16 +569,20 @@ export class PromotionService {
           videoUrl,
           mediaType,
           duration: mediaType === 'video' ? durationSec : undefined,
-          promoAmount:
-            offerType === 'order' ? Number(body.promoAmount) : 0,
-          promoCode: offerType === 'order' ? body.promoCode.trim() : '',
+          promoAmount: usesPromoCode ? Number(body.promoAmount) : 0,
+          promoCode: usesPromoCode ? body.promoCode.trim() : '',
           offerType,
           fulfillmentScopes,
           discountTiers: tiers.length ? tiers : undefined,
           tierMetricType:
-            offerType === 'booking_discount' ? body.tierMetricType : undefined,
+            offerType === 'booking_discount' || offerType === 'both'
+              ? body.tierMetricType || 'amount'
+              : undefined,
           startDate,
           expireDate,
+          startTime: schedule.startTime ?? null,
+          endTime: schedule.endTime ?? null,
+          scheduleSlots: schedule.scheduleSlots,
           menuItemIds,
         },
         include: {
@@ -544,7 +627,8 @@ export class PromotionService {
       userId,
       title: updateData.title ?? existing.title,
       description: updateData.description ?? existing.description ?? undefined,
-      thumbnailUrl: updateData.thumbnailUrl ?? existing.thumbnailUrl ?? undefined,
+      thumbnailUrl:
+        updateData.thumbnailUrl ?? existing.thumbnailUrl ?? undefined,
       videoUrl: updateData.videoUrl ?? existing.videoUrl ?? undefined,
       mediaType: updateData.mediaType ?? existing.mediaType,
       duration: updateData.duration ?? existing.duration ?? undefined,
@@ -554,9 +638,22 @@ export class PromotionService {
       fulfillmentScopes:
         updateData.fulfillmentScopes ?? existing.fulfillmentScopes,
       discountTiers: updateData.discountTiers ?? existing.discountTiers,
-      tierMetricType: updateData.tierMetricType ?? existing.tierMetricType ?? undefined,
+      tierMetricType:
+        updateData.tierMetricType ?? existing.tierMetricType ?? undefined,
       startDate: updateData.startDate ?? existing.startDate.toISOString(),
       expireDate: updateData.expireDate ?? existing.expireDate.toISOString(),
+      startTime:
+        updateData.startTime !== undefined
+          ? updateData.startTime
+          : (existing.startTime ?? undefined),
+      endTime:
+        updateData.endTime !== undefined
+          ? updateData.endTime
+          : (existing.endTime ?? undefined),
+      scheduleSlots:
+        updateData.scheduleSlots !== undefined
+          ? updateData.scheduleSlots
+          : existing.scheduleSlots,
       menuItemIds: updateData.menuItemIds ?? existing.menuItemIds,
     };
     const data = this.buildPromotionData(merged);
@@ -576,6 +673,7 @@ export class PromotionService {
       duration?: number;
       discountTiers?: string | unknown;
       fulfillmentScopes?: string[] | string;
+      scheduleSlots?: string | unknown;
     },
     requestUserId: string,
   ) {
@@ -605,14 +703,11 @@ export class PromotionService {
         patch.discountTiers = [];
       }
     }
-    if (typeof body.fulfillmentScopes === 'string' && body.fulfillmentScopes.trim()) {
+    if (typeof body.scheduleSlots === 'string' && body.scheduleSlots.trim()) {
       try {
-        patch.fulfillmentScopes = JSON.parse(body.fulfillmentScopes);
+        patch.scheduleSlots = JSON.parse(body.scheduleSlots);
       } catch {
-        patch.fulfillmentScopes = body.fulfillmentScopes
-          .split(',')
-          .map((s) => s.trim())
-          .filter(Boolean);
+        patch.scheduleSlots = [];
       }
     }
     if (body.menuItemIds && String(body.menuItemIds).trim()) {
@@ -628,12 +723,7 @@ export class PromotionService {
           .filter(Boolean);
       }
     }
-    return this.update(
-      promotionId,
-      body.userId,
-      patch,
-      requestUserId,
-    );
+    return this.update(promotionId, body.userId, patch, requestUserId);
   }
 
   async delete(promotionId: string, userId: string, requestUserId: string) {

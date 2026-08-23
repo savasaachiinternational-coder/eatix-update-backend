@@ -1,0 +1,4 @@
+-- AlterTable
+ALTER TABLE "Promotion" ADD COLUMN IF NOT EXISTS "startTime" TEXT;
+ALTER TABLE "Promotion" ADD COLUMN IF NOT EXISTS "endTime" TEXT;
+ALTER TABLE "Promotion" ADD COLUMN IF NOT EXISTS "scheduleSlots" JSONB;

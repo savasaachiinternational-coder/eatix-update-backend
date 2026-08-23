@@ -20,6 +20,7 @@ import {
 import { cacheGetOrSet } from '../common/ttl-cache.util';
 import { isValidUkPhone, normalizeUkPhone, extractPhoneFromDeliveryAddress } from '../common/phone.util';
 import {
+  appliesToOrders,
   calcPercentDiscount,
   findMatchingTier,
   getFreeTaxChargeTier,
@@ -27,6 +28,7 @@ import {
   matchesFulfillmentScope,
   parsePercentDiscountTiers,
   parsePromotionTiers,
+  promotionAppliesAt,
 } from '../promotion/promotion-discount.util';
 import {
   assertVendorItemQuantities,
@@ -288,7 +290,18 @@ export class RestaurantOrderService {
       offerType?: string | null;
       fulfillmentScopes?: string[] | null;
       discountTiers?: unknown;
+      startTime?: string | null;
+      endTime?: string | null;
+      scheduleSlots?: unknown;
     }) => {
+      if (!promotionAppliesAt(promo)) {
+        throw new BadRequestException(
+          'This promotion is not available at this day or time',
+        );
+      }
+      if (!appliesToOrders(promo.offerType)) {
+        throw new BadRequestException('This promotion is not valid for orders');
+      }
       const offerType = promo.offerType || 'order';
       const allTiers = parsePromotionTiers(promo.discountTiers);
       const freeTaxTier =
@@ -302,7 +315,7 @@ export class RestaurantOrderService {
 
       const billBeforeDiscount = itemsSubtotal + effectiveTaxCharge;
 
-      if (offerType === 'order') {
+      if (offerType === 'order' || offerType === 'both') {
         const percentTiers = parsePercentDiscountTiers(promo.discountTiers);
         if (percentTiers.length) {
           if (!matchesFulfillmentScope(promo.fulfillmentScopes, fulfillmentKey)) {
@@ -369,10 +382,10 @@ export class RestaurantOrderService {
             where: {
               userId: dto.ownerId,
               promoCode: dto.promoCode!.trim(),
-              offerType: 'order',
+              offerType: { in: ['order', 'both'] },
             },
           });
-      if (!promo || !isPromotionActive(promo)) {
+      if (!promo || !isPromotionActive(promo) || !promotionAppliesAt(promo)) {
         throw new BadRequestException('Invalid or expired promotion');
       }
       if (dto.promoCode?.trim() && promo.promoCode !== dto.promoCode.trim()) {
@@ -383,13 +396,16 @@ export class RestaurantOrderService {
       const amountPromos = await this.prisma.promotion.findMany({
         where: {
           userId: dto.ownerId,
-          offerType: { in: ['amount_discount', 'order'] },
+          offerType: { in: ['amount_discount', 'order', 'both'] },
           startDate: { lte: new Date() },
           expireDate: { gte: new Date() },
         },
         orderBy: { createdAt: 'desc' },
       });
       for (const promo of amountPromos) {
+        if (!promotionAppliesAt(promo)) {
+          continue;
+        }
         if (!matchesFulfillmentScope(promo.fulfillmentScopes, fulfillmentKey)) {
           continue;
         }

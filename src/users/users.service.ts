@@ -7,7 +7,7 @@ import {
   InternalServerErrorException,
   ForbiddenException,
 } from '@nestjs/common';
-import { haversineKm, isValidCoord, resolveOwnerAreaKm } from '../common/geo.util';
+import { haversineKm, isValidCoord, resolveOwnerAreaKm, UK_DEFAULT_RADIUS_KM } from '../common/geo.util';
 import { PrismaService } from '../prisma/prisma.service';
 import { CreateUserDto } from './dto/create-user.dto';
 import { LoginUserDto } from './dto/login-user.dto';
@@ -2288,6 +2288,215 @@ export class UsersService {
         page: safePage,
         limit: safeLimit,
         totalPages: Math.ceil(total / safeLimit),
+      },
+    };
+  }
+
+  private channelAvatarFromUser(
+    photos: unknown,
+    channelName: string,
+  ): string {
+    const firstPhoto = Array.isArray(photos) ? photos[0] : null;
+    const rawSrc =
+      firstPhoto && typeof firstPhoto === 'object' && 'src' in firstPhoto
+        ? (firstPhoto as { src?: string }).src
+        : null;
+    if (typeof rawSrc === 'string' && rawSrc.trim().length > 0) {
+      return rawSrc.trim();
+    }
+    return `https://ui-avatars.com/api/?name=${encodeURIComponent(
+      channelName,
+    )}&background=111&color=fff`;
+  }
+
+  private async attachOwnerChannelStats(ownerIds: string[]) {
+    const stats = new Map<
+      string,
+      { videoCount: number; shortCount: number; subscriberCount: number }
+    >();
+    if (!ownerIds.length) return stats;
+
+    const [videoGroups, shortGroups, subGroups] = await Promise.all([
+      this.prisma.video.groupBy({
+        by: ['userId'],
+        where: {
+          userId: { in: ownerIds },
+          status: { not: 'deleted' },
+          visibility: 'public',
+          OR: [
+            { scheduledPublishAt: null },
+            { scheduledPublishAt: { lte: new Date() } },
+          ],
+        },
+        _count: { _all: true },
+      }),
+      this.prisma.short.groupBy({
+        by: ['userId'],
+        where: {
+          userId: { in: ownerIds },
+          status: { not: 'deleted' },
+          visibility: 'public',
+          OR: [{ publishedAt: null }, { publishedAt: { lte: new Date() } }],
+        },
+        _count: { _all: true },
+      }),
+      this.prisma.channelSubscription.groupBy({
+        by: ['channelUserId'],
+        where: { channelUserId: { in: ownerIds } },
+        _count: { _all: true },
+      }),
+    ]);
+
+    ownerIds.forEach(id => {
+      stats.set(id, { videoCount: 0, shortCount: 0, subscriberCount: 0 });
+    });
+    videoGroups.forEach(row => {
+      const cur = stats.get(row.userId);
+      if (cur) cur.videoCount = row._count?._all || 0;
+    });
+    shortGroups.forEach(row => {
+      const cur = stats.get(row.userId);
+      if (cur) cur.shortCount = row._count?._all || 0;
+    });
+    subGroups.forEach(row => {
+      const cur = stats.get(row.channelUserId);
+      if (cur) cur.subscriberCount = row._count?._all || 0;
+    });
+    return stats;
+  }
+
+  /** Owners the viewer does not follow yet — paginated, for "You May Know". */
+  async getSuggestedFollowingOwners(
+    userId: string,
+    page = 1,
+    limit = 20,
+    opts?: { nearbyLat?: number; nearbyLng?: number; radiusKm?: number },
+  ): Promise<{
+    items: Array<{
+      userId: string;
+      name: string;
+      nickname: string | null;
+      channelName: string;
+      channelAvatar: string;
+      role: string;
+      videoCount: number;
+      shortCount: number;
+      subscriberCount: number;
+      distanceKm?: number | null;
+    }>;
+    pagination: { total: number; page: number; limit: number; totalPages: number };
+  }> {
+    const safePage = Math.max(1, Number(page) || 1);
+    const safeLimit = Math.min(50, Math.max(1, Number(limit) || 20));
+    const skip = (safePage - 1) * safeLimit;
+
+    const followingRows = await this.prisma.channelSubscription.findMany({
+      where: { subscriberId: userId },
+      select: { channelUserId: true },
+    });
+    const excludeIds = [
+      userId,
+      ...followingRows.map(r => r.channelUserId).filter(Boolean),
+    ];
+
+    let candidates: Array<{
+      id: string;
+      name: string | null;
+      nickname: string | null;
+      photos: unknown;
+      role: string | null;
+      latitude: number | null;
+      longitude: number | null;
+      distanceKm?: number;
+    }> = [];
+
+    const nearbyLat = opts?.nearbyLat;
+    const nearbyLng = opts?.nearbyLng;
+    const radiusKm = opts?.radiusKm ?? UK_DEFAULT_RADIUS_KM;
+
+    if (isValidCoord(nearbyLat) && isValidCoord(nearbyLng)) {
+      const geoOwners = await this.prisma.user.findMany({
+        where: {
+          role: 'owner',
+          id: { notIn: excludeIds },
+          latitude: { not: null },
+          longitude: { not: null },
+        },
+        select: {
+          id: true,
+          name: true,
+          nickname: true,
+          photos: true,
+          role: true,
+          latitude: true,
+          longitude: true,
+        },
+      });
+      candidates = geoOwners
+        .map(o => ({
+          ...o,
+          distanceKm: haversineKm(
+            nearbyLat,
+            nearbyLng,
+            o.latitude!,
+            o.longitude!,
+          ),
+        }))
+        .filter(o => o.distanceKm <= radiusKm)
+        .sort((a, b) => a.distanceKm - b.distanceKm);
+    } else {
+      candidates = await this.prisma.user.findMany({
+        where: {
+          role: 'owner',
+          id: { notIn: excludeIds },
+        },
+        select: {
+          id: true,
+          name: true,
+          nickname: true,
+          photos: true,
+          role: true,
+          latitude: true,
+          longitude: true,
+        },
+        orderBy: { createdAt: 'desc' },
+      });
+    }
+
+    const total = candidates.length;
+    const pageRows = candidates.slice(skip, skip + safeLimit);
+    const ownerIds = pageRows.map(o => o.id);
+    const statsMap = await this.attachOwnerChannelStats(ownerIds);
+
+    const items = pageRows.map(o => {
+      const channelName = o.nickname || o.name || 'Unknown';
+      const stat = statsMap.get(o.id) || {
+        videoCount: 0,
+        shortCount: 0,
+        subscriberCount: 0,
+      };
+      return {
+        userId: o.id,
+        name: o.name || channelName,
+        nickname: o.nickname ?? null,
+        channelName,
+        channelAvatar: this.channelAvatarFromUser(o.photos, channelName),
+        role: 'owner',
+        videoCount: stat.videoCount,
+        shortCount: stat.shortCount,
+        subscriberCount: stat.subscriberCount,
+        distanceKm:
+          typeof o.distanceKm === 'number' ? o.distanceKm : null,
+      };
+    });
+
+    return {
+      items,
+      pagination: {
+        total,
+        page: safePage,
+        limit: safeLimit,
+        totalPages: Math.ceil(total / safeLimit) || 0,
       },
     };
   }

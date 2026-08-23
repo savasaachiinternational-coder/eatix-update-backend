@@ -8,9 +8,11 @@ import { PrismaService } from '../prisma/prisma.service';
 import { NotificationService } from '../notification/notification.service';
 import { CreateRestaurantBookingDto } from './dto/create-restaurant-booking.dto';
 import {
+  appliesToBookings,
   findMatchingTier,
   isPromotionActive,
   parseDiscountTiers,
+  promotionAppliesAt,
 } from '../promotion/promotion-discount.util';
 
 type RestaurantBookingStatus =
@@ -87,7 +89,7 @@ export class RestaurantBookingService {
     const bookingPromos = await this.prisma.promotion.findMany({
       where: {
         userId: dto.ownerId,
-        offerType: 'booking_discount',
+        offerType: { in: ['booking_discount', 'both'] },
         startDate: { lte: new Date() },
         expireDate: { gte: new Date() },
       },
@@ -95,6 +97,9 @@ export class RestaurantBookingService {
     });
 
     const resolveBookingDiscount = (promo: (typeof bookingPromos)[0]) => {
+      if (!appliesToBookings(promo.offerType) || !promotionAppliesAt(promo, bookingDate)) {
+        return null;
+      }
       const metric = (promo.tierMetricType || 'people') as 'people' | 'amount';
       const value = metric === 'amount' ? bookingAmount : persons;
       if (value == null || !Number.isFinite(Number(value))) return null;
@@ -105,7 +110,7 @@ export class RestaurantBookingService {
 
     if (promotionId) {
       const selected = bookingPromos.find((p) => p.id === promotionId);
-      if (!selected || !isPromotionActive(selected)) {
+      if (!selected || !isPromotionActive(selected) || !promotionAppliesAt(selected, bookingDate)) {
         throw new BadRequestException('Invalid or expired booking promotion');
       }
       const match = resolveBookingDiscount(selected);

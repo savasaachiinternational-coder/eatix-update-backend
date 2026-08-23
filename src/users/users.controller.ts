@@ -474,6 +474,35 @@ export class UsersController {
     );
   }
 
+  @Get(':id/suggested-following')
+  @ApiOperation({
+    summary: 'Suggested owners to follow (You May Know — owners only, not already followed)',
+  })
+  @ApiResponse({ status: 200, description: 'Suggested owners retrieved successfully.' })
+  async getSuggestedFollowingOwners(
+    @Param('id') id: string,
+    @Query('page') page?: number,
+    @Query('limit') limit?: number,
+    @Query('nearbyLat') nearbyLat?: string,
+    @Query('nearbyLng') nearbyLng?: string,
+    @Query('radiusKm') radiusKm?: string,
+  ) {
+    const lat = nearbyLat != null ? parseFloat(nearbyLat) : undefined;
+    const lng = nearbyLng != null ? parseFloat(nearbyLng) : undefined;
+    const radius =
+      radiusKm != null ? parseFloat(radiusKm) : undefined;
+    return this.usersService.getSuggestedFollowingOwners(
+      id,
+      page || 1,
+      limit || 20,
+      {
+        nearbyLat: Number.isFinite(lat!) ? lat : undefined,
+        nearbyLng: Number.isFinite(lng!) ? lng : undefined,
+        radiusKm: Number.isFinite(radius!) ? radius : undefined,
+      },
+    );
+  }
+
   @Post(':id/upload-avatar')
   @UseGuards(JwtAuthGuard)
   @UseInterceptors(FileInterceptor('file'))

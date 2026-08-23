@@ -2223,12 +2223,15 @@ model Promotion {
   duration      Int?      // Seconds when video
   promoAmount   Float     @default(0) // Discount % for order promos (e.g. 10 = 10%)
   promoCode     String    @default("") // Code user enters (e.g. EATIX20)
-  offerType     String    @default("order") // order | amount_discount | booking_discount
+  offerType     String    @default("order") // order | amount_discount | booking_discount | both
   fulfillmentScopes String[] @default([]) // collection | delivery | both
   discountTiers Json?     // [{ minValue, maxValue?, percent, metricType?: amount|people }]
-  tierMetricType String?  // people | amount — default metric for booking_discount tiers
+  tierMetricType String?  // people | amount — default metric for booking_discount / both tiers
   startDate     DateTime  // When promotion becomes active
   expireDate    DateTime  // When promotion ends
+  startTime     String?   // HH:mm daily window start (Europe/London)
+  endTime       String?   // HH:mm daily window end (Europe/London)
+  scheduleSlots Json?     // [{ dayOfWeek: 0-6, startTime: "14:00", endTime: "15:00" }]
   menuItemIds   String[]  @default([]) // IDs of menu items included in this offer
   viewCount     Int       @default(0)
   createdAt     DateTime  @default(now())

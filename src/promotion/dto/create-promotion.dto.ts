@@ -53,7 +53,7 @@ export class CreatePromotionDto {
   @ApiPropertyOptional({
     description: 'Promo amount % for order promos (e.g. 10 = 10%)',
   })
-  @ValidateIf((o) => (o.offerType || 'order') === 'order')
+  @ValidateIf((o) => ['order', 'both'].includes(o.offerType || 'order'))
   @IsNotEmpty()
   @Type(() => Number)
   @IsNumber()
@@ -61,17 +61,17 @@ export class CreatePromotionDto {
   promoAmount?: number;
 
   @ApiPropertyOptional({ description: 'Promo code (e.g. EATIX20)' })
-  @ValidateIf((o) => (o.offerType || 'order') === 'order')
+  @ValidateIf((o) => ['order', 'both'].includes(o.offerType || 'order'))
   @IsNotEmpty()
   @IsString()
   promoCode?: string;
 
   @ApiPropertyOptional({
-    description: 'Offer type: order | amount_discount | booking_discount',
+    description: 'Offer type: order | amount_discount | booking_discount | both',
     default: 'order',
   })
   @IsOptional()
-  @IsIn(['order', 'amount_discount', 'booking_discount'])
+  @IsIn(['order', 'amount_discount', 'booking_discount', 'both'])
   offerType?: string;
 
   @ApiPropertyOptional({
@@ -105,6 +105,27 @@ export class CreatePromotionDto {
   @IsNotEmpty()
   @IsDateString()
   expireDate: string;
+
+  @ApiPropertyOptional({
+    description: 'Daily window start time HH:mm (Europe/London)',
+  })
+  @IsOptional()
+  @IsString()
+  startTime?: string;
+
+  @ApiPropertyOptional({
+    description: 'Daily window end time HH:mm (Europe/London)',
+  })
+  @IsOptional()
+  @IsString()
+  endTime?: string;
+
+  @ApiPropertyOptional({
+    description:
+      'Weekly slots: [{ dayOfWeek: 0-6 (Sun-Sat), startTime: "14:00", endTime: "15:00" }]',
+  })
+  @IsOptional()
+  scheduleSlots?: unknown;
 
   @ApiPropertyOptional({ description: 'Menu item IDs included in this offer', type: [String] })
   @IsOptional()

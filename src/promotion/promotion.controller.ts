@@ -146,6 +146,9 @@ export class PromotionController {
       fulfillmentScopes?: string | string[];
       discountTiers?: string;
       tierMetricType?: string;
+      startTime?: string;
+      endTime?: string;
+      scheduleSlots?: string;
     },
     @Request() req: { user: { id: string } },
   ) {
@@ -186,6 +189,9 @@ export class PromotionController {
         fulfillmentScopes: typeof body.fulfillmentScopes === 'string' ? body.fulfillmentScopes.split(',').map(s => s.trim()).filter(Boolean) : body.fulfillmentScopes,
         discountTiers: body.discountTiers,
         tierMetricType: body.tierMetricType,
+        startTime: body.startTime,
+        endTime: body.endTime,
+        scheduleSlots: body.scheduleSlots,
       },
       req.user.id,
     );
@@ -216,6 +222,9 @@ export class PromotionController {
       fulfillmentScopes?: string | string[];
       discountTiers?: string;
       tierMetricType?: string;
+      startTime?: string;
+      endTime?: string;
+      scheduleSlots?: string;
     },
     @Request() req: { user: { id: string } },
   ) {
@@ -245,6 +254,9 @@ export class PromotionController {
         fulfillmentScopes: typeof body.fulfillmentScopes === 'string' ? body.fulfillmentScopes.split(',').map(s => s.trim()).filter(Boolean) : body.fulfillmentScopes,
         discountTiers: body.discountTiers,
         tierMetricType: body.tierMetricType,
+        startTime: body.startTime,
+        endTime: body.endTime,
+        scheduleSlots: body.scheduleSlots,
       },
       req.user.id,
     );
