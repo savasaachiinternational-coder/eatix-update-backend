@@ -359,6 +359,49 @@ export class CreateShortDto {
   @Max(120)
   exportFps?: number;
 
+  @ApiPropertyOptional({ description: 'Number of timeline clip files in the files[] upload' })
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(0)
+  @Max(12)
+  clipCount?: number;
+
+  @ApiPropertyOptional({
+    description: 'CapCut-style clip timeline (JSON array)',
+    type: [Object],
+  })
+  @IsOptional()
+  @Transform(({ value }) => {
+    if (!value) return [];
+    if (Array.isArray(value)) return value;
+    try {
+      const parsed = JSON.parse(String(value));
+      return Array.isArray(parsed) ? parsed : [];
+    } catch {
+      return [];
+    }
+  })
+  @IsArray()
+  clips?: Array<{
+    fileIndex?: number;
+    type?: string;
+    trimStartSec?: number;
+    trimEndSec?: number;
+    speedFactor?: number;
+    volume?: number;
+    durationSec?: number;
+  }>;
+
+  @ApiPropertyOptional({ description: 'Burn Eatwaze logo (default true)' })
+  @IsOptional()
+  @Transform(({ value }) => {
+    if (value === false || value === 'false' || value === '0') return false;
+    return true;
+  })
+  @IsBoolean()
+  watermark?: boolean;
+
   @ApiPropertyOptional({ description: 'Duration in seconds' })
   @IsOptional()
   @Type(() => Number)

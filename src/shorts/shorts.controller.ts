@@ -59,26 +59,46 @@ export class ShortsController {
   @ApiOperation({ summary: 'Upload short video with thumbnail' })
   @ApiConsumes('multipart/form-data')
   @ApiResponse({ status: 201, description: 'Short uploaded successfully' })
-  @UseInterceptors(FilesInterceptor('files', 2, multerShortsOptions))
+  @UseInterceptors(FilesInterceptor('files', 12, multerShortsOptions))
   async uploadShort(
     @UploadedFiles() files: Express.Multer.File[],
     @Body() createShortDto: CreateShortDto,
   ) {
     if (!files || files.length < 1) {
-      throw new BadRequestException('Video file is required');
+      throw new BadRequestException('A video or photo file is required');
     }
 
-    const videoFile = files.find((f) => f.mimetype.startsWith('video/'));
-    const thumbnailFile = files.find((f) => f.mimetype.startsWith('image/'));
+    const clipCount = Math.max(0, Number(createShortDto.clipCount) || 0);
+    let clipFiles: Express.Multer.File[] = [];
+    let thumbnailFile: Express.Multer.File | null = null;
+    let primaryFile: Express.Multer.File | undefined;
 
-    if (!videoFile) {
-      throw new BadRequestException('Video file is required');
+    if (clipCount > 0 && files.length >= clipCount) {
+      clipFiles = files.slice(0, clipCount);
+      thumbnailFile =
+        files.slice(clipCount).find((f) => f.mimetype.startsWith('image/')) ||
+        null;
+      primaryFile = clipFiles[0];
+    } else {
+      primaryFile =
+        files.find((f) => f.mimetype.startsWith('video/')) ||
+        files.find((f) => f.mimetype.startsWith('image/'));
+      thumbnailFile =
+        files.find(
+          (f) => f !== primaryFile && f.mimetype.startsWith('image/'),
+        ) || null;
+      if (primaryFile) clipFiles = [primaryFile];
+    }
+
+    if (!primaryFile) {
+      throw new BadRequestException('A video or photo file is required');
     }
 
     return this.shortsService.uploadShort(
-      videoFile,
-      thumbnailFile || null,
+      primaryFile,
+      thumbnailFile,
       createShortDto,
+      clipFiles,
     );
   }
 

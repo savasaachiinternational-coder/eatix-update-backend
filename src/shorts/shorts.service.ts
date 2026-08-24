@@ -234,22 +234,37 @@ export class ShortsService {
     try {
       // Download the raw upload from R2 to disk, then process with FFmpeg if needed.
       await this.r2Storage.downloadToFile(rawKey, inPath);
-      const shouldProcess = this.shortsTranscode.shouldProcess(dto);
-      if (shouldProcess) {
+      const wmFallback = path.join(
+        os.tmpdir(),
+        `eatix-sh-presign-wm-${id}.mp4`,
+      );
+      try {
+        processedPath = await this.shortsTranscode.processFile(inPath, {
+          ...dto,
+          watermark: true,
+        });
+        if (processedPath && processedPath !== inPath)
+          cleanupPaths.add(processedPath);
+      } catch (e: any) {
+        this.logger.warn(
+          `completePresignedUpload transcode failed, watermarking raw: ${e?.message || e}`,
+        );
         try {
-          processedPath = await this.shortsTranscode.processFile(inPath, dto);
-          if (processedPath && processedPath !== inPath)
-            cleanupPaths.add(processedPath);
-        } catch (e: any) {
-          // Some mobile encoders/container variants fail ffprobe/ffmpeg detection.
-          // In that case, keep user flow successful by falling back to raw upload.
-          this.logger.warn(
-            `completePresignedUpload transcode failed, using raw input: ${e?.message || e}`,
+          await this.shortsTranscode.applyWatermark(inPath, wmFallback);
+          processedPath = wmFallback;
+          cleanupPaths.add(wmFallback);
+        } catch (wmErr: any) {
+          this.logger.error(
+            `Watermark fallback failed: ${wmErr?.message || wmErr}`,
           );
-          processedPath = inPath;
+          throw new BadRequestException(
+            'Could not add Eatwaze logo to this video. Try a shorter clip and upload again.',
+          );
         }
-      } else {
-        processedPath = inPath;
+      }
+
+      if (!processedPath) {
+        throw new BadRequestException('Video processing failed');
       }
 
       const uploaded = await this.r2Storage.uploadFileFromPath(
@@ -261,9 +276,35 @@ export class ShortsService {
       const videoUrl = uploaded.url;
 
       const thumbKey = dto.thumbnailKey ? String(dto.thumbnailKey).trim() : '';
-      let thumbnailUrl = thumbKey
-        ? this.r2Storage.getPublicUrl(thumbKey)
-        : null;
+      let thumbnailUrl = null as string | null;
+      if (thumbKey) {
+        const thumbIn = path.join(
+          os.tmpdir(),
+          `eatix-sh-presign-thumb-${id}.jpg`,
+        );
+        const thumbOut = path.join(
+          os.tmpdir(),
+          `eatix-sh-presign-thumb-wm-${id}.jpg`,
+        );
+        cleanupPaths.add(thumbIn);
+        cleanupPaths.add(thumbOut);
+        try {
+          await this.r2Storage.downloadToFile(thumbKey, thumbIn);
+          await this.shortsTranscode.applyWatermarkToImage(thumbIn, thumbOut);
+          const uploadedThumb = await this.r2Storage.uploadFileFromPath(
+            thumbOut,
+            'thumb.jpg',
+            'image/jpeg',
+            'shorts/thumbnails',
+          );
+          thumbnailUrl = uploadedThumb.url;
+        } catch (e: any) {
+          this.logger.warn(
+            `Thumbnail watermark failed, using original cover: ${e?.message || e}`,
+          );
+          thumbnailUrl = this.r2Storage.getPublicUrl(thumbKey);
+        }
+      }
       if (!thumbnailUrl && processedPath) {
         thumbnailUrl = await this.uploadShortThumbnailFromVideoPath(processedPath);
       }
@@ -376,6 +417,7 @@ export class ShortsService {
     videoFile: Express.Multer.File,
     thumbnailFile: Express.Multer.File | null,
     createShortDto: CreateShortDto,
+    extraClipFiles: Express.Multer.File[] = [],
   ) {
     const limitCheck = await this.subscriptionService.checkCanUploadShort(
       createShortDto.userId,
@@ -388,6 +430,9 @@ export class ShortsService {
       if ((videoFile as any)?.path) cleanupPaths.add((videoFile as any).path);
       if ((thumbnailFile as any)?.path)
         cleanupPaths.add((thumbnailFile as any).path);
+      for (const extra of extraClipFiles) {
+        if ((extra as any)?.path) cleanupPaths.add((extra as any).path);
+      }
 
       let videoUpload = {
         path: videoFile?.path,
@@ -396,7 +441,13 @@ export class ShortsService {
         size: videoFile?.size,
         buffer: videoFile?.buffer,
       };
-      if (this.shortsTranscode.shouldProcess(createShortDto)) {
+      const needsProcess =
+        this.shortsTranscode.shouldProcess(createShortDto) ||
+        extraClipFiles.length > 1 ||
+        (Array.isArray(createShortDto.clips) &&
+          createShortDto.clips.length > 1) ||
+        String(videoFile?.mimetype || '').startsWith('image/');
+      if (needsProcess) {
         try {
           const baseName = (videoFile.originalname || 'short.mp4').replace(
             /\.[^.]+$/,
@@ -406,6 +457,7 @@ export class ShortsService {
             const processedPath = await this.shortsTranscode.processFile(
               videoFile.path,
               createShortDto,
+              extraClipFiles,
             );
             if (processedPath && processedPath !== videoFile.path)
               cleanupPaths.add(processedPath);
@@ -465,11 +517,31 @@ export class ShortsService {
 
       let thumbnailUrl: string | null = null;
       if (thumbnailFile) {
-        const thumb = thumbnailFile?.path
+        let thumbPath = (thumbnailFile as any)?.path as string | undefined;
+        let thumbName = thumbnailFile.originalname || 'thumb.jpg';
+        let thumbMime = thumbnailFile.mimetype || 'image/jpeg';
+        if (thumbPath) {
+          const wmThumb = path.join(
+            os.tmpdir(),
+            `eatix-thumb-wm-${Date.now()}.jpg`,
+          );
+          try {
+            await this.shortsTranscode.applyWatermarkToImage(thumbPath, wmThumb);
+            cleanupPaths.add(wmThumb);
+            thumbPath = wmThumb;
+            thumbName = 'thumb.jpg';
+            thumbMime = 'image/jpeg';
+          } catch (e: any) {
+            this.logger.warn(
+              `Thumbnail watermark failed: ${e?.message || e}`,
+            );
+          }
+        }
+        const thumb = thumbPath
           ? await this.r2Storage.uploadFileFromPath(
-              thumbnailFile.path,
-              thumbnailFile.originalname || 'thumb.jpg',
-              thumbnailFile.mimetype || 'image/jpeg',
+              thumbPath,
+              thumbName,
+              thumbMime,
               'shorts/thumbnails',
             )
           : await this.r2Storage.uploadFile(thumbnailFile, 'shorts/thumbnails');
@@ -510,7 +582,7 @@ export class ShortsService {
           duration: createShortDto.duration,
           durationLimit: createShortDto.durationLimit || '60',
           fileSize: videoFile.size,
-          mimeType: videoFile.mimetype,
+          mimeType: videoUpload.mimetype || 'video/mp4',
           filterId: createShortDto.filterId,
           filterName: createShortDto.filterName,
           soundId: createShortDto.soundId,
@@ -642,27 +714,70 @@ export class ShortsService {
     try {
       if (videoFile) {
         await tryDeleteR2(short.videoUrl);
-        const { url: videoUrl } = (videoFile as any)?.path
+        let videoPath = (videoFile as any)?.path as string | undefined;
+        let videoName = videoFile.originalname || 'short.mp4';
+        let videoMime = 'video/mp4';
+        if (videoPath) {
+          const wmVideo = path.join(
+            os.tmpdir(),
+            `eatix-replace-wm-${Date.now()}.mp4`,
+          );
+          try {
+            const processed = await this.shortsTranscode.processFile(videoPath, {
+              watermark: true,
+            } as CreateShortDto);
+            if (processed && processed !== videoPath) {
+              cleanupPaths.add(processed);
+              videoPath = processed;
+            }
+          } catch {
+            await this.shortsTranscode.applyWatermark(videoPath, wmVideo);
+            cleanupPaths.add(wmVideo);
+            videoPath = wmVideo;
+          }
+          videoName = 'short.mp4';
+        }
+        const { url: videoUrl } = videoPath
           ? await this.r2Storage.uploadFileFromPath(
-              (videoFile as any).path,
-              videoFile.originalname || 'short.mp4',
-              videoFile.mimetype || 'video/mp4',
+              videoPath,
+              videoName,
+              videoMime,
               'shorts',
             )
           : await this.r2Storage.uploadFile(videoFile, 'shorts');
         data.videoUrl = videoUrl;
         data.fileSize = videoFile.size;
-        data.mimeType = videoFile.mimetype;
+        data.mimeType = videoMime;
       }
 
       if (thumbnailFile) {
         await tryDeleteR2(short.thumbnailUrl);
         await tryDeleteR2(short.coverUrl);
-        const { url: thumbUrl } = (thumbnailFile as any)?.path
+        let thumbPath = (thumbnailFile as any)?.path as string | undefined;
+        let thumbName = thumbnailFile.originalname || 'thumb.jpg';
+        let thumbMime = thumbnailFile.mimetype || 'image/jpeg';
+        if (thumbPath) {
+          const wmThumb = path.join(
+            os.tmpdir(),
+            `eatix-replace-thumb-wm-${Date.now()}.jpg`,
+          );
+          try {
+            await this.shortsTranscode.applyWatermarkToImage(thumbPath, wmThumb);
+            cleanupPaths.add(wmThumb);
+            thumbPath = wmThumb;
+            thumbName = 'thumb.jpg';
+            thumbMime = 'image/jpeg';
+          } catch (e: any) {
+            this.logger.warn(
+              `replaceShortMedia thumbnail watermark failed: ${e?.message || e}`,
+            );
+          }
+        }
+        const { url: thumbUrl } = thumbPath
           ? await this.r2Storage.uploadFileFromPath(
-              (thumbnailFile as any).path,
-              thumbnailFile.originalname || 'thumb.jpg',
-              thumbnailFile.mimetype || 'image/jpeg',
+              thumbPath,
+              thumbName,
+              thumbMime,
               'shorts/thumbnails',
             )
           : await this.r2Storage.uploadFile(thumbnailFile, 'shorts/thumbnails');

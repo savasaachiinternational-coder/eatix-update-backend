@@ -8,7 +8,6 @@ import { CreateShortDto } from './dto/shorts.dto';
 import {
   buildAtempoChain,
   buildShortsVideoFilters,
-  shortsShouldTranscode,
 } from './shorts-ffmpeg-presets';
 
 async function unlinkQuiet(p: string | null | undefined) {
@@ -41,7 +40,9 @@ export class ShortsTranscodeService {
   constructor(private readonly http: HttpService) {}
 
   shouldProcess(dto: CreateShortDto): boolean {
-    return shortsShouldTranscode(dto);
+    if (process.env.SHORTS_DISABLE_FFMPEG === '1') return false;
+    // Always transcode so the Eatwaze logo is burned into the published file.
+    return true;
   }
 
   async process(videoBuffer: Buffer, dto: CreateShortDto): Promise<Buffer> {
@@ -166,10 +167,18 @@ export class ShortsTranscodeService {
         exportVideoSuffix: exportSuffix,
       });
       if (args.length === 0) {
-        return videoBuffer;
+        const wmOnly = path.join(os.tmpdir(), `eatix-sh-wm-${id}.mp4`);
+        await this.applyWatermark(inPath, wmOnly);
+        const buf = await fs.readFile(wmOnly);
+        await unlinkQuiet(wmOnly);
+        return buf;
       }
       await this.runFfmpeg(args);
-      return await fs.readFile(outPath);
+      const wmPath = path.join(os.tmpdir(), `eatix-sh-wm-${id}.mp4`);
+      await this.applyWatermark(outPath, wmPath);
+      const outBuf = await fs.readFile(wmPath);
+      await unlinkQuiet(wmPath);
+      return outBuf;
     } finally {
       await this.unlinkPaths(segmentPaths);
       await unlinkQuiet(inPath);
@@ -184,36 +193,86 @@ export class ShortsTranscodeService {
    * Process a local file path (avoids buffering the whole input in memory).
    * Returns the processed MP4 file path (caller is responsible for deleting it).
    */
-  async processFile(inputPath: string, dto: CreateShortDto): Promise<string> {
+  async processFile(
+    inputPath: string,
+    dto: CreateShortDto,
+    extraClipFiles: Express.Multer.File[] = [],
+  ): Promise<string> {
     const id = `${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
     const outPath = path.join(os.tmpdir(), `eatix-sh-out-${id}.mp4`);
+    const wmPath = path.join(os.tmpdir(), `eatix-sh-wm-${id}.mp4`);
     const mergedPath = path.join(os.tmpdir(), `eatix-sh-merged-${id}.mp4`);
+    const stillPath = path.join(os.tmpdir(), `eatix-sh-still-${id}.mp4`);
     let soundPath: string | null = null;
     let subtitlesAssPath: string | null = null;
     let segmentPaths: string[] = [];
     let workPath = inputPath;
     let cleanupMerged = false;
+    let cleanupStill = false;
+    let clipsMergedPath: string | null = null;
     try {
       await this.assertFfmpegAvailable();
-      const sourceMeta = await this.probeVideoMeta(inputPath);
-      const hasAudio = await this.probeHasAudio(inputPath);
-      const trimS =
-        dto.trimStartSec != null && Number(dto.trimStartSec) > 0
+      const clipsMeta = Array.isArray(dto.clips) ? dto.clips : [];
+      const clipFiles =
+        extraClipFiles?.length > 0
+          ? extraClipFiles
+          : [{ path: inputPath, mimetype: 'video/mp4' } as Express.Multer.File];
+      const timelineMeta =
+        clipsMeta.length > 0
+          ? clipsMeta
+          : clipFiles.length > 1
+            ? clipFiles.map((_, i) => ({
+                fileIndex: i,
+                type: String(clipFiles[i]?.mimetype || '').startsWith('image/')
+                  ? 'photo'
+                  : 'video',
+              }))
+            : [];
+      if (timelineMeta.length > 0 && clipFiles.length > 0) {
+        this.logger.log(
+          `Joining ${timelineMeta.length} clip(s) from ${clipFiles.length} file(s) into one video`,
+        );
+        clipsMergedPath = await this.buildTimelineFromClips(
+          clipFiles,
+          timelineMeta,
+          id,
+        );
+        workPath = clipsMergedPath;
+        cleanupMerged = true;
+      } else if (this.isImageSource(inputPath, dto)) {
+        const dur = Math.max(
+          0.5,
+          Number(dto.trimEndSec || dto.duration || 3) -
+            Number(dto.trimStartSec || 0) || 3,
+        );
+        await this.stillToVideo(inputPath, stillPath, dur);
+        workPath = stillPath;
+        cleanupStill = true;
+      }
+      const skipSourceTrim = Boolean(clipsMergedPath);
+      const sourceMeta = await this.probeVideoMeta(workPath);
+      const hasAudio = await this.probeHasAudio(workPath);
+      const trimS = skipSourceTrim
+        ? 0
+        : dto.trimStartSec != null && Number(dto.trimStartSec) > 0
           ? Number(dto.trimStartSec)
           : 0;
-      let trimE =
-        dto.trimEndSec != null && Number(dto.trimEndSec) > trimS
+      let trimE = skipSourceTrim
+        ? sourceMeta.durationSec
+        : dto.trimEndSec != null && Number(dto.trimEndSec) > trimS
           ? Number(dto.trimEndSec)
           : 0;
       if (!trimE || trimE > sourceMeta.durationSec) {
         trimE = sourceMeta.durationSec;
       }
-      const splits = this.normalizeSplitPoints(dto.splitPoints, trimS, trimE);
+      const splits = skipSourceTrim
+        ? []
+        : this.normalizeSplitPoints(dto.splitPoints, trimS, trimE);
       const ranges = this.buildSegmentRanges(trimS, trimE, splits);
 
       if (ranges.length > 1) {
         segmentPaths = await this.extractSegmentFiles(
-          inputPath,
+          workPath,
           ranges,
           id,
           hasAudio,
@@ -250,8 +309,9 @@ export class ShortsTranscodeService {
       if (dto.soundUrl?.trim()) {
         soundPath = await this.downloadSound(dto.soundUrl.trim(), id);
       }
-      const speed =
-        dto.speedFactor != null && dto.speedFactor > 0
+      const speed = skipSourceTrim
+        ? 1
+        : dto.speedFactor != null && dto.speedFactor > 0
           ? Number(dto.speedFactor)
           : 1;
       const vf = buildShortsVideoFilters({
@@ -282,7 +342,7 @@ export class ShortsTranscodeService {
         });
         await fs.writeFile(subtitlesAssPath, assDoc, 'utf8');
       }
-      const useMerged = ranges.length > 1;
+      const useMerged = ranges.length > 1 || skipSourceTrim;
       const args = this.composeFfmpegArgs({
         inPath: workPath,
         outPath,
@@ -303,17 +363,320 @@ export class ShortsTranscodeService {
         musicVolume: dto.musicVolume,
         exportVideoSuffix: exportSuffix,
       });
-      if (args.length === 0) {
-        // no processing requested; return original path
-        return inputPath;
+      const encodedPath = args.length === 0 ? workPath : outPath;
+      if (args.length > 0) {
+        await this.runFfmpeg(args);
       }
-      await this.runFfmpeg(args);
-      return outPath;
+      await this.applyWatermark(encodedPath, wmPath);
+      return wmPath;
     } finally {
       await this.unlinkPaths(segmentPaths);
       if (cleanupMerged) await unlinkQuiet(mergedPath);
+      if (cleanupStill) await unlinkQuiet(stillPath);
+      if (clipsMergedPath && clipsMergedPath !== mergedPath) {
+        await unlinkQuiet(clipsMergedPath);
+      }
       await unlinkQuiet(soundPath);
       await unlinkQuiet(subtitlesAssPath ?? undefined);
+    }
+  }
+
+  private async resolveWatermarkLogo(): Promise<string | null> {
+    const envPath = String(process.env.EATWAZE_WATERMARK_PATH || '').trim();
+    const candidates = [
+      envPath || null,
+      path.join(process.cwd(), 'assets', 'eatwaze-watermark.png'),
+      path.join(__dirname, '..', '..', 'assets', 'eatwaze-watermark.png'),
+      path.join(__dirname, '..', '..', '..', 'assets', 'eatwaze-watermark.png'),
+      path.join(
+        process.cwd(),
+        '..',
+        'Ethics-app',
+        'src',
+        'assets',
+        'logo.png',
+      ),
+    ].filter(Boolean) as string[];
+    for (const p of candidates) {
+      try {
+        await fs.access(p);
+        return p;
+      } catch {
+        /* try next */
+      }
+    }
+    this.logger.error(
+      `Eatwaze watermark PNG not found. Tried: ${candidates.join(' | ')}`,
+    );
+    return null;
+  }
+
+  async applyWatermark(inPath: string, outPath: string): Promise<void> {
+    const logo = await this.resolveWatermarkLogo();
+    const hasAudio = await this.probeHasAudio(inPath);
+    const overlay =
+      '[1:v]scale=240:-1,format=rgba,pad=iw+20:ih+12:10:6:black@0.38[wm];' +
+      '[0:v][wm]overlay=W-w-16:H-h-16';
+    if (logo) {
+      try {
+        // Do not use -shortest with a still PNG: that would cut the video to 1 frame.
+        await this.runFfmpeg([
+          '-y',
+          '-i',
+          inPath,
+          '-i',
+          logo,
+          '-filter_complex',
+          overlay,
+          '-c:v',
+          'libx264',
+          '-preset',
+          'veryfast',
+          '-crf',
+          '23',
+          '-pix_fmt',
+          'yuv420p',
+          ...(hasAudio
+            ? (['-c:a', 'aac', '-b:a', '192k'] as string[])
+            : (['-an'] as string[])),
+          '-movflags',
+          '+faststart',
+          outPath,
+        ]);
+        return;
+      } catch (e) {
+        this.logger.warn(
+          `Logo overlay failed, falling back to text: ${(e as Error)?.message}`,
+        );
+      }
+    }
+    await this.runFfmpeg([
+      '-y',
+      '-i',
+      inPath,
+      '-vf',
+      "drawtext=text='Eatwaze':fontcolor=white:fontsize=36:x=w-tw-24:y=h-th-24:box=1:boxcolor=black@0.4:boxborderw=8",
+      '-c:v',
+      'libx264',
+      '-preset',
+      'veryfast',
+      '-crf',
+      '23',
+      '-pix_fmt',
+      'yuv420p',
+      ...(hasAudio
+        ? (['-c:a', 'aac', '-b:a', '192k'] as string[])
+        : (['-an'] as string[])),
+      '-movflags',
+      '+faststart',
+      outPath,
+    ]);
+  }
+
+  async applyWatermarkToImage(inPath: string, outPath: string): Promise<void> {
+    const logo = await this.resolveWatermarkLogo();
+    if (!logo) {
+      await fs.copyFile(inPath, outPath);
+      return;
+    }
+    await this.runFfmpeg([
+      '-y',
+      '-i',
+      inPath,
+      '-i',
+      logo,
+      '-filter_complex',
+      '[1:v]scale=180:-1,format=rgba,pad=iw+16:ih+10:8:5:black@0.38[wm];' +
+        '[0:v][wm]overlay=W-w-12:H-h-12',
+      '-frames:v',
+      '1',
+      '-q:v',
+      '3',
+      outPath,
+    ]);
+  }
+
+  private isImageSource(inputPath: string, dto?: CreateShortDto): boolean {
+    const lower = String(inputPath || '').toLowerCase();
+    if (/\.(jpg|jpeg|png|webp|heic)$/.test(lower)) return true;
+    const first = Array.isArray(dto?.clips) ? dto.clips[0] : null;
+    return String(first?.type || '').toLowerCase() === 'photo';
+  }
+
+  private clipCanvasFilter(): string {
+    return [
+      'scale=1080:1920:force_original_aspect_ratio=decrease',
+      'pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black',
+      'fps=30',
+      'setsar=1',
+      'format=yuv420p',
+    ].join(',');
+  }
+
+  private async stillToVideo(
+    imagePath: string,
+    outPath: string,
+    durationSec: number,
+  ): Promise<void> {
+    const dur = Math.max(0.5, Math.min(12, Number(durationSec) || 3));
+    await this.runFfmpeg([
+      '-y',
+      '-loop',
+      '1',
+      '-t',
+      String(dur),
+      '-i',
+      imagePath,
+      '-f',
+      'lavfi',
+      '-t',
+      String(dur),
+      '-i',
+      'anullsrc=channel_layout=stereo:sample_rate=44100',
+      '-vf',
+      this.clipCanvasFilter(),
+      '-c:v',
+      'libx264',
+      '-preset',
+      'veryfast',
+      '-crf',
+      '23',
+      '-pix_fmt',
+      'yuv420p',
+      '-c:a',
+      'aac',
+      '-b:a',
+      '192k',
+      '-ar',
+      '44100',
+      '-ac',
+      '2',
+      '-shortest',
+      '-movflags',
+      '+faststart',
+      outPath,
+    ]);
+  }
+
+  private async extractClipSegment(
+    inputPath: string,
+    outPath: string,
+    meta: {
+      type?: string;
+      trimStartSec?: number;
+      trimEndSec?: number;
+      speedFactor?: number;
+      durationSec?: number;
+    },
+    isPhoto: boolean,
+  ): Promise<void> {
+    if (isPhoto) {
+      const dur = Math.max(
+        0.5,
+        Number(meta.trimEndSec || meta.durationSec || 3) -
+          Number(meta.trimStartSec || 0),
+      );
+      await this.stillToVideo(inputPath, outPath, dur);
+      return;
+    }
+    const ts = Number(meta.trimStartSec || 0);
+    const te = Number(meta.trimEndSec || 0);
+    const speed = Math.max(0.25, Number(meta.speedFactor || 1));
+    const span =
+      te > ts
+        ? te - ts
+        : Math.max(0.5, Number(meta.durationSec || 3) - ts);
+    const outDur = Math.max(0.05, span / speed);
+    const vfParts = [];
+    if (Math.abs(speed - 1) > 0.001) vfParts.push(`setpts=PTS/${speed}`);
+    vfParts.push(this.clipCanvasFilter());
+    const vf = vfParts.join(',');
+    const hasAudio = await this.probeHasAudio(inputPath);
+    const args: string[] = ['-y'];
+    if (ts > 0.02) args.push('-ss', String(ts));
+    args.push('-t', String(span), '-i', inputPath);
+    if (!hasAudio) {
+      args.push(
+        '-f',
+        'lavfi',
+        '-t',
+        String(outDur),
+        '-i',
+        'anullsrc=channel_layout=stereo:sample_rate=44100',
+      );
+    }
+    args.push('-vf', vf);
+    if (hasAudio) {
+      args.push(
+        '-af',
+        'aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo',
+      );
+    }
+    args.push(
+      '-c:v',
+      'libx264',
+      '-preset',
+      'veryfast',
+      '-crf',
+      '23',
+      '-pix_fmt',
+      'yuv420p',
+      '-c:a',
+      'aac',
+      '-b:a',
+      '192k',
+      '-ar',
+      '44100',
+      '-ac',
+      '2',
+      '-t',
+      String(outDur),
+      '-movflags',
+      '+faststart',
+      outPath,
+    );
+    await this.runFfmpeg(args);
+  }
+
+  private async buildTimelineFromClips(
+    clipFiles: Express.Multer.File[],
+    clipsMeta: Array<{
+      fileIndex?: number;
+      type?: string;
+      trimStartSec?: number;
+      trimEndSec?: number;
+      speedFactor?: number;
+      durationSec?: number;
+    }>,
+    id: string,
+  ): Promise<string> {
+    const segs: string[] = [];
+    try {
+      for (let i = 0; i < clipsMeta.length; i += 1) {
+        const meta = clipsMeta[i];
+        const fileIdx = Number(meta.fileIndex);
+        const file = clipFiles[Number.isFinite(fileIdx) ? fileIdx : 0];
+        const src = file?.path;
+        if (!src) continue;
+        const isPhoto =
+          String(meta.type || '').toLowerCase() === 'photo' ||
+          String(file?.mimetype || '').startsWith('image/');
+        const out = path.join(os.tmpdir(), `eatix-sh-clip-${id}-${i}.mp4`);
+        await this.extractClipSegment(src, out, meta, isPhoto);
+        segs.push(out);
+      }
+      if (!segs.length) {
+        throw new Error('No clips to merge');
+      }
+      const merged = path.join(os.tmpdir(), `eatix-sh-clips-${id}.mp4`);
+      if (segs.length === 1) {
+        await fs.copyFile(segs[0], merged);
+      } else {
+        await this.concatDemuxerReencode(segs, merged);
+      }
+      return merged;
+    } finally {
+      await this.unlinkPaths(segs);
     }
   }
 
@@ -421,6 +784,8 @@ export class ShortsTranscodeService {
     }
     const args = [
       '-y',
+      '-fflags',
+      '+genpts',
       '-f',
       'concat',
       '-safe',

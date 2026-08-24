@@ -34,7 +34,7 @@ export const multerShortsOptions: MulterOptions = {
     } else {
       cb(
         new BadRequestException(
-          'Invalid file. Shorts accept video (mp4, mov, etc.) and image (thumbnail)',
+          'Invalid file. Shorts accept video (mp4, mov, etc.) and image (photos / thumbnail)',
         ),
         false,
       );

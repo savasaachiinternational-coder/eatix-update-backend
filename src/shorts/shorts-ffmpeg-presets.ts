@@ -82,8 +82,12 @@ export function shortsShouldTranscode(dto: {
   exportWidth?: number;
   exportHeight?: number;
   exportFps?: number;
+  clips?: Array<{ fileIndex?: number; type?: string }>;
+  watermark?: boolean;
 }): boolean {
   if (process.env.SHORTS_DISABLE_FFMPEG === '1') return false;
+  if (dto.watermark !== false) return true;
+  if (Array.isArray(dto.clips) && dto.clips.length > 1) return true;
   const sound = dto.soundUrl != null && String(dto.soundUrl).trim().length > 0;
   if (sound) return true;
   const beauty = dto.beautyLevel != null && Number(dto.beautyLevel) > 0;
