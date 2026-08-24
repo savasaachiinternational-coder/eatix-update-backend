@@ -290,6 +290,8 @@ export class RestaurantOrderService {
       offerType?: string | null;
       fulfillmentScopes?: string[] | null;
       discountTiers?: unknown;
+      startDate: Date | string;
+      expireDate: Date | string;
       startTime?: string | null;
       endTime?: string | null;
       scheduleSlots?: unknown;
