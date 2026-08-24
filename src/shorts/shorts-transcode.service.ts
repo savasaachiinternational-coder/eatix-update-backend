@@ -416,7 +416,7 @@ export class ShortsTranscodeService {
     const hasAudio = await this.probeHasAudio(inPath);
     const overlay =
       '[1:v]scale=240:-1,format=rgba,pad=iw+20:ih+12:10:6:black@0.38[wm];' +
-      '[0:v][wm]overlay=W-w-16:H-h-16';
+      '[0:v][wm]overlay=W-w-16:16';
     if (logo) {
       try {
         // Do not use -shortest with a still PNG: that would cut the video to 1 frame.
@@ -455,7 +455,7 @@ export class ShortsTranscodeService {
       '-i',
       inPath,
       '-vf',
-      "drawtext=text='Eatwaze':fontcolor=white:fontsize=36:x=w-tw-24:y=h-th-24:box=1:boxcolor=black@0.4:boxborderw=8",
+      "drawtext=text='Eatwaze':fontcolor=white:fontsize=36:x=w-tw-24:y=20:box=1:boxcolor=black@0.4:boxborderw=8",
       '-c:v',
       'libx264',
       '-preset',
@@ -487,7 +487,7 @@ export class ShortsTranscodeService {
       logo,
       '-filter_complex',
       '[1:v]scale=180:-1,format=rgba,pad=iw+16:ih+10:8:5:black@0.38[wm];' +
-        '[0:v][wm]overlay=W-w-12:H-h-12',
+        '[0:v][wm]overlay=W-w-12:12',
       '-frames:v',
       '1',
       '-q:v',
