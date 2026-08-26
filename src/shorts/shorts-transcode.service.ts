@@ -411,17 +411,93 @@ export class ShortsTranscodeService {
     return null;
   }
 
+  /**
+   * Phone videos often store landscape pixels + rotate metadata.
+   * filter_complex does not always autorotate, so a "top-right" overlay
+   * can appear bottom-right after players apply rotation. Bake orientation first.
+   */
+  private async probeDisplayRotationDeg(inputPath: string): Promise<number> {
+    return new Promise((resolve) => {
+      const p = spawn(
+        ffprobeBin(),
+        [
+          '-v',
+          'error',
+          '-select_streams',
+          'v:0',
+          '-show_entries',
+          'stream_tags=rotate:stream_side_data=rotation',
+          '-of',
+          'json',
+          inputPath,
+        ],
+        { stdio: ['ignore', 'pipe', 'pipe'] },
+      );
+      let out = '';
+      p.stdout.on('data', (d: Buffer) => {
+        out += d.toString();
+      });
+      p.on('error', () => resolve(0));
+      p.on('close', () => {
+        try {
+          const j = JSON.parse(out) as {
+            streams?: Array<{
+              tags?: { rotate?: string };
+              side_data_list?: Array<{ rotation?: number | string }>;
+            }>;
+          };
+          const stream = j.streams?.[0];
+          const tag = Number(stream?.tags?.rotate);
+          if (Number.isFinite(tag) && tag !== 0) {
+            resolve(((Math.round(tag) % 360) + 360) % 360);
+            return;
+          }
+          const side = stream?.side_data_list || [];
+          for (const s of side) {
+            const r = Number(s?.rotation);
+            if (Number.isFinite(r) && r !== 0) {
+              // Display matrix rotation is often negative (e.g. -90).
+              resolve(((Math.round(-r) % 360) + 360) % 360);
+              return;
+            }
+          }
+        } catch {
+          /* ignore */
+        }
+        resolve(0);
+      });
+    });
+  }
+
+  /** FFmpeg filter prefix that uprights the coded frame (empty if already upright). */
+  private orientationFilterPrefix(rotationDeg: number): string {
+    const r = ((Math.round(rotationDeg) % 360) + 360) % 360;
+    if (r === 90) return 'transpose=1,'; // 90° CW
+    if (r === 180) return 'hflip,vflip,';
+    if (r === 270) return 'transpose=2,'; // 90° CCW
+    return '';
+  }
+
   async applyWatermark(inPath: string, outPath: string): Promise<void> {
     const logo = await this.resolveWatermarkLogo();
     const hasAudio = await this.probeHasAudio(inPath);
+    const rotation = await this.probeDisplayRotationDeg(inPath);
+    const orient = this.orientationFilterPrefix(rotation);
+    // Exact middle-center — logo only (transparent PNG, no box/border).
+    // Must stay centered on the published file (not only create-preview UI).
     const overlay =
-      '[1:v]scale=240:-1,format=rgba,pad=iw+20:ih+12:10:6:black@0.38[wm];' +
-      '[0:v][wm]overlay=W-w-16:16';
+      `[0:v]${orient}format=yuv420p[base];` +
+      '[1:v]scale=280:-1,format=rgba[wm];' +
+      '[base][wm]overlay=(W-w)/2:(H-h)/2';
+    this.logger.log(
+      `Burning Eatwaze watermark CENTER (rotation=${rotation}° logo=${logo || 'drawtext'})`,
+    );
     if (logo) {
       try {
         // Do not use -shortest with a still PNG: that would cut the video to 1 frame.
         await this.runFfmpeg([
           '-y',
+          '-noautorotate',
           '-i',
           inPath,
           '-i',
@@ -441,8 +517,11 @@ export class ShortsTranscodeService {
             : (['-an'] as string[])),
           '-movflags',
           '+faststart',
+          '-metadata:s:v:0',
+          'rotate=0',
           outPath,
         ]);
+        this.logger.log('Eatwaze CENTER watermark applied to video');
         return;
       } catch (e) {
         this.logger.warn(
@@ -450,12 +529,15 @@ export class ShortsTranscodeService {
         );
       }
     }
+    // Text fallback: no box — just the wordmark, centered.
+    const textVf = `${orient}drawtext=text='eatwaze':fontcolor=white:fontsize=42:x=(w-text_w)/2:y=(h-text_h)/2`;
     await this.runFfmpeg([
       '-y',
+      '-noautorotate',
       '-i',
       inPath,
       '-vf',
-      "drawtext=text='Eatwaze':fontcolor=white:fontsize=36:x=w-tw-24:y=20:box=1:boxcolor=black@0.4:boxborderw=8",
+      textVf,
       '-c:v',
       'libx264',
       '-preset',
@@ -469,8 +551,11 @@ export class ShortsTranscodeService {
         : (['-an'] as string[])),
       '-movflags',
       '+faststart',
+      '-metadata:s:v:0',
+      'rotate=0',
       outPath,
     ]);
+    this.logger.log('Eatwaze CENTER text watermark applied to video');
   }
 
   async applyWatermarkToImage(inPath: string, outPath: string): Promise<void> {
@@ -479,15 +564,20 @@ export class ShortsTranscodeService {
       await fs.copyFile(inPath, outPath);
       return;
     }
+    const rotation = await this.probeDisplayRotationDeg(inPath);
+    const orient = this.orientationFilterPrefix(rotation);
+    this.logger.log(`Burning Eatwaze watermark CENTER on image (rotation=${rotation}°)`);
     await this.runFfmpeg([
       '-y',
+      '-noautorotate',
       '-i',
       inPath,
       '-i',
       logo,
       '-filter_complex',
-      '[1:v]scale=180:-1,format=rgba,pad=iw+16:ih+10:8:5:black@0.38[wm];' +
-        '[0:v][wm]overlay=W-w-12:12',
+      `[0:v]${orient}format=rgba[base];` +
+        '[1:v]scale=220:-1,format=rgba[wm];' +
+        '[base][wm]overlay=(W-w)/2:(H-h)/2',
       '-frames:v',
       '1',
       '-q:v',
