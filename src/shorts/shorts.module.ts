@@ -8,6 +8,7 @@ import { R2StorageModule } from '../r2-storage/r2-storage.module';
 import { SubscriptionModule } from '../subscription/subscription.module';
 import { NotificationModule } from '../notification/notification.module';
 import { ScheduledContentModule } from '../scheduled-content/scheduled-content.module';
+import { NoLogoCreditsModule } from '../no-logo-credits/no-logo-credits.module';
 
 @Module({
   imports: [
@@ -20,6 +21,7 @@ import { ScheduledContentModule } from '../scheduled-content/scheduled-content.m
     SubscriptionModule,
     NotificationModule,
     ScheduledContentModule,
+    NoLogoCreditsModule,
   ],
   controllers: [ShortsController],
   providers: [ShortsService, ShortsTranscodeService],

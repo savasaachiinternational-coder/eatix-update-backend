@@ -68,6 +68,7 @@ import { AppRatingModule } from './app-rating/app-rating.module';
 import { SocialAccountsModule } from './social-accounts/social-accounts.module';
 import { SocialAuthModule } from './social-auth/social-auth.module';
 import { PaymentsModule } from './payments/payments.module';
+import { NoLogoCreditsModule } from './no-logo-credits/no-logo-credits.module';
 
 @Module({
   providers: [SocketService],
@@ -140,6 +141,7 @@ import { PaymentsModule } from './payments/payments.module';
     SocialAccountsModule,
     SocialAuthModule,
     PaymentsModule,
+    NoLogoCreditsModule,
   ],
 })
 export class AppModule implements NestModule {

@@ -28,6 +28,7 @@ import {
   ShortViewDto,
 } from './dto/shorts.dto';
 import { ShortsTranscodeService } from './shorts-transcode.service';
+import { NoLogoCreditsService } from '../no-logo-credits/no-logo-credits.service';
 import {
   extractVideoThumbnailFromPath,
 } from '../common/video-thumbnail.util';
@@ -53,7 +54,32 @@ export class ShortsService {
     private notificationService: NotificationService,
     private shortsTranscode: ShortsTranscodeService,
     private readonly scheduledContentService: ScheduledContentService,
+    private readonly noLogoCredits: NoLogoCreditsService,
   ) {}
+
+  private wantsWatermark(dto: { watermark?: boolean }): boolean {
+    return dto?.watermark !== false;
+  }
+
+  private async prepareWatermarkOption(userId: string, dto: { watermark?: boolean }) {
+    const withLogo = this.wantsWatermark(dto);
+    if (!withLogo) {
+      await this.noLogoCredits.assertCanSkipWatermark(userId);
+    }
+    return withLogo;
+  }
+
+  private async finishWatermarkOption(userId: string, withLogo: boolean) {
+    if (!withLogo) {
+      try {
+        await this.noLogoCredits.consumeOneCredit(userId);
+      } catch (e: any) {
+        this.logger.warn(
+          `Failed to consume no-logo credit for ${userId}: ${e?.message || e}`,
+        );
+      }
+    }
+  }
 
   private async uploadShortThumbnailFromVideoPath(
     videoPath: string,
@@ -234,6 +260,7 @@ export class ShortsService {
     try {
       // Download the raw upload from R2 to disk, then process with FFmpeg if needed.
       await this.r2Storage.downloadToFile(rawKey, inPath);
+      const withLogo = await this.prepareWatermarkOption(dto.userId, dto);
       const wmFallback = path.join(
         os.tmpdir(),
         `eatix-sh-presign-wm-${id}.mp4`,
@@ -241,7 +268,7 @@ export class ShortsService {
       try {
         processedPath = await this.shortsTranscode.processFile(inPath, {
           ...dto,
-          watermark: true,
+          watermark: withLogo,
         });
         if (processedPath && processedPath !== inPath)
           cleanupPaths.add(processedPath);
@@ -250,9 +277,13 @@ export class ShortsService {
           `completePresignedUpload transcode failed, watermarking raw: ${e?.message || e}`,
         );
         try {
-          await this.shortsTranscode.applyWatermark(inPath, wmFallback);
-          processedPath = wmFallback;
-          cleanupPaths.add(wmFallback);
+          if (withLogo) {
+            await this.shortsTranscode.applyWatermark(inPath, wmFallback);
+            processedPath = wmFallback;
+            cleanupPaths.add(wmFallback);
+          } else {
+            processedPath = inPath;
+          }
         } catch (wmErr: any) {
           this.logger.error(
             `Watermark fallback failed: ${wmErr?.message || wmErr}`,
@@ -290,14 +321,24 @@ export class ShortsService {
         cleanupPaths.add(thumbOut);
         try {
           await this.r2Storage.downloadToFile(thumbKey, thumbIn);
-          await this.shortsTranscode.applyWatermarkToImage(thumbIn, thumbOut);
-          const uploadedThumb = await this.r2Storage.uploadFileFromPath(
-            thumbOut,
-            'thumb.jpg',
-            'image/jpeg',
-            'shorts/thumbnails',
-          );
-          thumbnailUrl = uploadedThumb.url;
+          if (withLogo) {
+            await this.shortsTranscode.applyWatermarkToImage(thumbIn, thumbOut);
+            const uploadedThumb = await this.r2Storage.uploadFileFromPath(
+              thumbOut,
+              'thumb.jpg',
+              'image/jpeg',
+              'shorts/thumbnails',
+            );
+            thumbnailUrl = uploadedThumb.url;
+          } else {
+            const uploadedThumb = await this.r2Storage.uploadFileFromPath(
+              thumbIn,
+              'thumb.jpg',
+              'image/jpeg',
+              'shorts/thumbnails',
+            );
+            thumbnailUrl = uploadedThumb.url;
+          }
         } catch (e: any) {
           this.logger.warn(
             `Thumbnail watermark failed, using original cover: ${e?.message || e}`,
@@ -397,10 +438,8 @@ export class ShortsService {
           .catch(() => null);
       }
 
+      await this.finishWatermarkOption(dto.userId, withLogo);
       return short;
-    } catch (e: any) {
-      this.logger.error(`completePresignedUpload: ${e?.message || e}`);
-      throw new BadRequestException(e?.message || 'Failed to complete upload');
     } finally {
       for (const p of cleanupPaths) {
         try {
@@ -425,6 +464,11 @@ export class ShortsService {
     if (!limitCheck.allowed) {
       throw new BadRequestException(limitCheck.message);
     }
+    const withLogo = await this.prepareWatermarkOption(
+      createShortDto.userId,
+      createShortDto,
+    );
+    createShortDto.watermark = withLogo;
     const cleanupPaths = new Set<string>();
     try {
       if ((videoFile as any)?.path) cleanupPaths.add((videoFile as any).path);
@@ -446,7 +490,8 @@ export class ShortsService {
         extraClipFiles.length > 1 ||
         (Array.isArray(createShortDto.clips) &&
           createShortDto.clips.length > 1) ||
-        String(videoFile?.mimetype || '').startsWith('image/');
+        String(videoFile?.mimetype || '').startsWith('image/') ||
+        withLogo;
       if (needsProcess) {
         try {
           const baseName = (videoFile.originalname || 'short.mp4').replace(
@@ -526,11 +571,16 @@ export class ShortsService {
             `eatix-thumb-wm-${Date.now()}.jpg`,
           );
           try {
-            await this.shortsTranscode.applyWatermarkToImage(thumbPath, wmThumb);
-            cleanupPaths.add(wmThumb);
-            thumbPath = wmThumb;
-            thumbName = 'thumb.jpg';
-            thumbMime = 'image/jpeg';
+            if (withLogo) {
+              await this.shortsTranscode.applyWatermarkToImage(
+                thumbPath,
+                wmThumb,
+              );
+              cleanupPaths.add(wmThumb);
+              thumbPath = wmThumb;
+              thumbName = 'thumb.jpg';
+              thumbMime = 'image/jpeg';
+            }
           } catch (e: any) {
             this.logger.warn(
               `Thumbnail watermark failed: ${e?.message || e}`,
@@ -644,6 +694,7 @@ export class ShortsService {
           })
           .catch(() => null);
       }
+      await this.finishWatermarkOption(createShortDto.userId, withLogo);
       return short;
     } catch (error: any) {
       this.logger.error(`Error uploading short: ${error.message}`);

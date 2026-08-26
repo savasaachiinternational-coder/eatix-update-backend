@@ -198,6 +198,10 @@ model User {
   subscriptionPackageId String?
   subscriptionPackage   SubscriptionPackage? @relation(fields: [subscriptionPackageId], references: [id], onDelete: SetNull)
 
+  // Credits for uploads without Eatwaze logo (paid packs: 10 / 20 / 30)
+  noLogoCredits            Int                   @default(0)
+  noLogoCreditPurchases    NoLogoCreditPurchase[]
+
   blocksMade     UserBlock[] @relation("UserBlocksMade")
   blocksReceived UserBlock[] @relation("UserBlocksReceived")
 
@@ -205,11 +209,27 @@ model User {
   @@index([subscriptionPackageId])
 }
 
+// Paid packs that grant no-logo upload credits (consumable)
+model NoLogoCreditPurchase {
+  id                    String   @id @default(uuid())
+  userId                String
+  packageKey            String // pack10 | pack20 | pack30
+  itemCount             Int
+  amountGbp             Float
+  stripePaymentIntentId String   @unique
+  status                String   @default("paid")
+  createdAt             DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
 // App rating / feedback per user (one row per user)
 model AppRating {
   id        String   @id @default(uuid())
   userId    String   @unique
-  rating    Int      // 1..5
+  rating    Int // 1..5
   comment   String?
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt

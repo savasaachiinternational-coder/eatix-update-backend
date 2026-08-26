@@ -167,6 +167,9 @@ export class ShortsTranscodeService {
         exportVideoSuffix: exportSuffix,
       });
       if (args.length === 0) {
+        if (dto.watermark === false) {
+          return await fs.readFile(inPath);
+        }
         const wmOnly = path.join(os.tmpdir(), `eatix-sh-wm-${id}.mp4`);
         await this.applyWatermark(inPath, wmOnly);
         const buf = await fs.readFile(wmOnly);
@@ -174,6 +177,9 @@ export class ShortsTranscodeService {
         return buf;
       }
       await this.runFfmpeg(args);
+      if (dto.watermark === false) {
+        return await fs.readFile(outPath);
+      }
       const wmPath = path.join(os.tmpdir(), `eatix-sh-wm-${id}.mp4`);
       await this.applyWatermark(outPath, wmPath);
       const outBuf = await fs.readFile(wmPath);
@@ -363,9 +369,16 @@ export class ShortsTranscodeService {
         musicVolume: dto.musicVolume,
         exportVideoSuffix: exportSuffix,
       });
-      const encodedPath = args.length === 0 ? workPath : outPath;
+    const wantsWatermark = dto.watermark !== false;
+    const encodedPath = args.length === 0 ? workPath : outPath;
       if (args.length > 0) {
         await this.runFfmpeg(args);
+      }
+      if (!wantsWatermark) {
+        if (encodedPath === wmPath) return wmPath;
+        if (encodedPath === outPath) return outPath;
+        await fs.copyFile(encodedPath, wmPath);
+        return wmPath;
       }
       await this.applyWatermark(encodedPath, wmPath);
       return wmPath;

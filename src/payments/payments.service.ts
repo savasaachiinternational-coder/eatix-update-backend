@@ -70,6 +70,7 @@ export class PaymentsService {
     totalAmount: number;
     currency?: string;
     description?: string;
+    metadata?: Record<string, string>;
   }) {
     if (!this.stripe) {
       throw new ServiceUnavailableException('Stripe is not configured');
@@ -94,6 +95,7 @@ export class PaymentsService {
           userId: params.userId,
           ownerId: params.ownerId,
           totalAmountPence: String(amount),
+          ...(params.metadata || {}),
         },
       });
 
@@ -117,6 +119,59 @@ export class PaymentsService {
         stripeMessage || 'Payment provider could not start checkout',
       );
     }
+  }
+
+  /**
+   * Verify a succeeded PaymentIntent for non-order products (e.g. no-logo credits).
+   */
+  async verifyPaymentIntentSucceeded(params: {
+    paymentIntentId: string;
+    userId: string;
+    expectedType?: string;
+  }) {
+    if (!this.stripe) {
+      throw new ServiceUnavailableException('Stripe is not configured');
+    }
+    const paymentIntentId = String(params.paymentIntentId || '').trim();
+    if (!paymentIntentId) {
+      throw new BadRequestException('paymentIntentId is required');
+    }
+
+    let intent: Stripe.PaymentIntent;
+    try {
+      intent = await this.stripe.paymentIntents.retrieve(paymentIntentId);
+    } catch (err: unknown) {
+      const stripeMessage =
+        err && typeof err === 'object' && 'message' in err
+          ? String((err as { message?: string }).message || '')
+          : '';
+      throw new BadRequestException(
+        stripeMessage || 'Could not verify payment with Stripe',
+      );
+    }
+
+    if (intent.status !== 'succeeded') {
+      throw new BadRequestException('Payment has not been completed');
+    }
+
+    const metaUserId = intent.metadata?.userId;
+    if (metaUserId && metaUserId !== params.userId) {
+      throw new BadRequestException('Payment does not belong to this user');
+    }
+
+    if (
+      params.expectedType &&
+      intent.metadata?.type &&
+      intent.metadata.type !== params.expectedType
+    ) {
+      throw new BadRequestException('Payment type does not match');
+    }
+
+    return {
+      paymentIntentId: intent.id,
+      amountReceived: intent.amount_received || intent.amount || 0,
+      metadata: intent.metadata || {},
+    };
   }
 
   async verifyPaymentForOrder(params: {
