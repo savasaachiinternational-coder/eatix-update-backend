@@ -261,10 +261,6 @@ export class ShortsService {
       // Download the raw upload from R2 to disk, then process with FFmpeg if needed.
       await this.r2Storage.downloadToFile(rawKey, inPath);
       const withLogo = await this.prepareWatermarkOption(dto.userId, dto);
-      const wmFallback = path.join(
-        os.tmpdir(),
-        `eatix-sh-presign-wm-${id}.mp4`,
-      );
       try {
         processedPath = await this.shortsTranscode.processFile(inPath, {
           ...dto,
@@ -273,25 +269,10 @@ export class ShortsService {
         if (processedPath && processedPath !== inPath)
           cleanupPaths.add(processedPath);
       } catch (e: any) {
-        this.logger.warn(
-          `completePresignedUpload transcode failed, watermarking raw: ${e?.message || e}`,
+        this.logger.error(`Short export failed: ${e?.message || e}`);
+        throw new BadRequestException(
+          'Video processing failed. Your edits were not published. Please retry or change the selected music.',
         );
-        try {
-          if (withLogo) {
-            await this.shortsTranscode.applyWatermark(inPath, wmFallback);
-            processedPath = wmFallback;
-            cleanupPaths.add(wmFallback);
-          } else {
-            processedPath = inPath;
-          }
-        } catch (wmErr: any) {
-          this.logger.error(
-            `Watermark fallback failed: ${wmErr?.message || wmErr}`,
-          );
-          throw new BadRequestException(
-            'Could not add Eatwaze logo to this video. Try a shorter clip and upload again.',
-          );
-        }
       }
 
       if (!processedPath) {
@@ -534,7 +515,10 @@ export class ShortsService {
             `Shorts FFmpeg failed (upload aborted, source not stored raw): ${e?.message}`,
             e?.stack,
           );
-          if (process.env.SHORTS_UPLOAD_RAW_ON_FFMPEG_FAIL === '1') {
+          if (
+            process.env.SHORTS_UPLOAD_RAW_ON_FFMPEG_FAIL === '1' &&
+            !createShortDto.soundUrl?.trim()
+          ) {
             this.logger.warn(
               'SHORTS_UPLOAD_RAW_ON_FFMPEG_FAIL=1: falling back to unprocessed video',
             );

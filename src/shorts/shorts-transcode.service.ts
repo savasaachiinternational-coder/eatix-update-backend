@@ -1,4 +1,4 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { BadRequestException, Injectable, Logger } from '@nestjs/common';
 import { HttpService } from '@nestjs/axios';
 import { spawn } from 'child_process';
 import * as fs from 'fs/promises';
@@ -40,7 +40,14 @@ export class ShortsTranscodeService {
   constructor(private readonly http: HttpService) {}
 
   shouldProcess(dto: CreateShortDto): boolean {
-    if (process.env.SHORTS_DISABLE_FFMPEG === '1') return false;
+    if (process.env.SHORTS_DISABLE_FFMPEG === '1') {
+      if (dto.soundUrl?.trim()) {
+        throw new BadRequestException(
+          'Music export is temporarily unavailable. Please retry later.',
+        );
+      }
+      return false;
+    }
     // Always transcode so the Eatwaze logo is burned into the published file.
     return true;
   }
@@ -621,7 +628,7 @@ export class ShortsTranscodeService {
     outPath: string,
     durationSec: number,
   ): Promise<void> {
-    const dur = Math.max(0.5, Math.min(12, Number(durationSec) || 3));
+    const dur = Math.max(0.05, Math.min(32, Number(durationSec) || 3));
     await this.runFfmpeg([
       '-y',
       '-loop',
@@ -670,14 +677,16 @@ export class ShortsTranscodeService {
       trimEndSec?: number;
       speedFactor?: number;
       durationSec?: number;
+      volume?: number;
     },
     isPhoto: boolean,
   ): Promise<void> {
     if (isPhoto) {
       const dur = Math.max(
-        0.5,
-        Number(meta.trimEndSec || meta.durationSec || 3) -
-          Number(meta.trimStartSec || 0),
+        0.05,
+        (Number(meta.trimEndSec || meta.durationSec || 3) -
+          Number(meta.trimStartSec || 0)) /
+          Math.max(0.25, Number(meta.speedFactor) || 1),
       );
       await this.stillToVideo(inputPath, outPath, dur);
       return;
@@ -712,7 +721,7 @@ export class ShortsTranscodeService {
     if (hasAudio) {
       args.push(
         '-af',
-        'aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo',
+        `${buildAtempoChain(speed)},volume=${this.clampVolume(meta.volume, 1)},apad,aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo`,
       );
     }
     args.push(
@@ -750,6 +759,7 @@ export class ShortsTranscodeService {
       trimEndSec?: number;
       speedFactor?: number;
       durationSec?: number;
+      volume?: number;
     }>,
     id: string,
   ): Promise<string> {
@@ -1236,6 +1246,8 @@ export class ShortsTranscodeService {
           ...trimArgs,
           '-i',
           inPath,
+          '-stream_loop',
+          '-1',
           '-i',
           soundPath,
           '-map',
@@ -1256,13 +1268,15 @@ export class ShortsTranscodeService {
       }
       const videoChain = vchain || `setpts=PTS/${speed}`;
       const audioMix = hasAudio
-        ? `[0:a]volume=${ov.toFixed(3)}[a0];[1:a]volume=${mv.toFixed(3)}[a1];[a0][a1]amix=inputs=2:duration=first:dropout_transition=2[a]`
+        ? `[0:a]${buildAtempoChain(speed)},asetpts=PTS-STARTPTS,volume=${ov.toFixed(3)},apad[a0];[1:a]asetpts=PTS-STARTPTS,volume=${mv.toFixed(3)}[a1];[a0][a1]amix=inputs=2:duration=longest:normalize=0,alimiter=limit=0.95:level=0:latency=1[a]`
         : `[1:a]volume=${mv.toFixed(3)}[a]`;
       return [
         ...base,
         ...trimArgs,
         '-i',
         inPath,
+        '-stream_loop',
+        '-1',
         '-i',
         soundPath,
         '-filter_complex',
