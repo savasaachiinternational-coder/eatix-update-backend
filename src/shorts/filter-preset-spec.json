@@ -1,0 +1,26 @@
+{
+  "$schema": "This file is checked into both Ethics-app and eatix-backend and MUST stay byte-identical between them. See SYNC.md in either repo root before editing.",
+  "version": 1,
+  "presets": [
+    { "id": "1", "name": "Vintage", "hex": "#8B7355", "opacity": 0.25 },
+    { "id": "2", "name": "Warm", "hex": "#FF8C42", "opacity": 0.2 },
+    { "id": "3", "name": "Cool", "hex": "#4A90D9", "opacity": 0.2 },
+    { "id": "4", "name": "Cinematic", "hex": "#2D1B4E", "opacity": 0.3 },
+    { "id": "5", "name": "Moody", "hex": "#1a1a2e", "opacity": 0.35 },
+    { "id": "6", "name": "Bright", "hex": "#FFFFFF", "opacity": 0.15 },
+    { "id": "7", "name": "Dramatic", "hex": "#2C1810", "opacity": 0.4 },
+    { "id": "8", "name": "Natural", "hex": "#5A8F5A", "opacity": 0.12 },
+    { "id": "9", "name": "Fade", "hex": "#F5E6D3", "opacity": 0.2 },
+    { "id": "10", "name": "Noir", "hex": "#1a1a1a", "opacity": 0.5 },
+    { "id": "11", "name": "Black & White", "hex": "#808080", "opacity": 0.45 },
+    { "id": "12", "name": "Grayscale", "hex": "#6B6B6B", "opacity": 0.5 },
+    { "id": "13", "name": "Golden", "hex": "#C9A227", "opacity": 0.22 },
+    { "id": "14", "name": "Teal", "hex": "#2A9D8F", "opacity": 0.22 },
+    { "id": "15", "name": "Vivid", "hex": "#E63946", "opacity": 0.18 },
+    { "id": "16", "name": "Matte", "hex": "#6D6875", "opacity": 0.28 },
+    { "id": "17", "name": "Punchy B&W", "hex": "#2B2B2B", "opacity": 0.42 },
+    { "id": "18", "name": "Glow", "hex": "#FFE5B4", "opacity": 0.2 },
+    { "id": "19", "name": "Film", "hex": "#3D2C1E", "opacity": 0.32 },
+    { "id": "20", "name": "Crush", "hex": "#1A1A2E", "opacity": 0.38 }
+  ]
+}
