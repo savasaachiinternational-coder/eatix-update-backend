@@ -1,3 +1,5 @@
+import filterPresetSpec from './filter-preset-spec.json';
+
 /**
  * FFmpeg video filters aligned with app `filterEffects.js`.
  * Preview uses a semi-transparent color overlay; we bake the same blend into pixels
@@ -5,31 +7,19 @@
  */
 
 /**
- * Same hex + opacity as `Ethics-app/src/constants/filterEffects.js` FILTER_EFFECTS.
- * Keep these in sync when changing in-app looks.
+ * Built from filter-preset-spec.json, a file checked into BOTH this repo
+ * and Ethics-app (src/constants/filter-preset-spec.json) so they can never
+ * drift apart silently — a checksum guard (`npm run verify:filter-spec`)
+ * fails the build if this JSON changes without a matching, reviewed edit
+ * on both sides. See SYNC.md at the repo root. Do not hand-edit this
+ * Record; edit the JSON and regenerate the checksum instead.
  */
-const FILTER_OVERLAY: Record<string, { hex: string; opacity: number }> = {
-  '1': { hex: '#8B7355', opacity: 0.25 },
-  '2': { hex: '#FF8C42', opacity: 0.2 },
-  '3': { hex: '#4A90D9', opacity: 0.2 },
-  '4': { hex: '#2D1B4E', opacity: 0.3 },
-  '5': { hex: '#1a1a2e', opacity: 0.35 },
-  '6': { hex: '#FFFFFF', opacity: 0.15 },
-  '7': { hex: '#2C1810', opacity: 0.4 },
-  '8': { hex: '#5A8F5A', opacity: 0.12 },
-  '9': { hex: '#F5E6D3', opacity: 0.2 },
-  '10': { hex: '#1a1a1a', opacity: 0.5 },
-  '11': { hex: '#808080', opacity: 0.45 },
-  '12': { hex: '#6B6B6B', opacity: 0.5 },
-  '13': { hex: '#C9A227', opacity: 0.22 },
-  '14': { hex: '#2A9D8F', opacity: 0.22 },
-  '15': { hex: '#E63946', opacity: 0.18 },
-  '16': { hex: '#6D6875', opacity: 0.28 },
-  '17': { hex: '#2B2B2B', opacity: 0.42 },
-  '18': { hex: '#FFE5B4', opacity: 0.2 },
-  '19': { hex: '#3D2C1E', opacity: 0.32 },
-  '20': { hex: '#1A1A2E', opacity: 0.38 },
-};
+const FILTER_OVERLAY: Record<string, { hex: string; opacity: number }> =
+  Object.fromEntries(
+    (filterPresetSpec.presets as Array<{ id: string; hex: string; opacity: number }>).map(
+      (preset) => [preset.id, { hex: preset.hex, opacity: preset.opacity }],
+    ),
+  );
 
 /** When `filterId` is unknown (e.g. CMS-only), still apply a mild grade so output is re-encoded. */
 const FILTER_FALLBACK_VF =
