@@ -250,12 +250,17 @@ export function shortsShouldTranscode(dto: {
   backgroundColor?: string;
   clips?: Array<{ fileIndex?: number; type?: string }>;
   watermark?: boolean;
+  composition?: string;
+  layoutId?: string;
+  stickers?: Array<{ catalogId?: string }>;
 }): boolean {
   if (process.env.SHORTS_DISABLE_FFMPEG === '1') return false;
   if (dto.watermark !== false) return true;
   if (Array.isArray(dto.clips) && dto.clips.length > 1) return true;
   const ar = String(dto.aspectRatio || '').trim();
   if (ar && ar !== '9:16') return true;
+  if (String(dto.composition || '').toLowerCase() === 'collage') return true;
+  if (Array.isArray(dto.stickers) && dto.stickers.length > 0) return true;
   if (parseCanvasFit(dto.canvasFit) === 'fit') return true;
   const bg = normalizeBackgroundHex(dto.backgroundColor);
   if (bg !== '#000000') return true;

@@ -15,6 +15,8 @@ cross-repo CI. Follow it exactly when touching a synced file.
 |---|---|---|
 | `src/constants/filter-preset-spec.json` | `src/shorts/filter-preset-spec.json` | Filter/theme id → color-grade `{hex, opacity}` |
 | `src/constants/canvasSpec.js` `CANVAS_DIMS` | `src/shorts/shorts-ffmpeg-presets.ts` `CANVAS_DIMS` | Quality × ratio → even pixel size, default fill |
+| `src/constants/collageLayouts.js` | `src/shorts/shorts-collage.ts` | Collage slot rects 0–1 |
+| `src/assets/stickers/*.png` | `assets/stickers/*.png` | Sticker catalog PNGs |
 
 (Future additions — sticker catalog, collage layouts — should follow the
 same pattern and be added to this table.)

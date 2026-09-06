@@ -12,6 +12,15 @@ import {
   resolveCanvasFromDto,
   type CanvasTarget,
 } from './shorts-ffmpeg-presets';
+import {
+  getCollageLayout,
+  layoutSlotPixels,
+  xstackLayout,
+} from './shorts-collage';
+import {
+  normalizeStickerLayers,
+  type StickerLayer,
+} from './shorts-stickers';
 
 async function unlinkQuiet(p: string | null | undefined) {
   if (!p) return;
@@ -248,16 +257,30 @@ export class ShortsTranscodeService {
               }))
             : [];
       const canvas = resolveCanvasFromDto(dto);
+      const collageLayout = getCollageLayout(dto.layoutId);
+      const useCollage =
+        String(dto.composition || '').toLowerCase() === 'collage' &&
+        Boolean(collageLayout);
       if (timelineMeta.length > 0 && clipFiles.length > 0) {
         this.logger.log(
-          `Joining ${timelineMeta.length} clip(s) from ${clipFiles.length} file(s) into one video`,
+          useCollage
+            ? `Collage ${collageLayout!.id} from ${timelineMeta.length} clip(s)`
+            : `Joining ${timelineMeta.length} clip(s) from ${clipFiles.length} file(s) into one video`,
         );
-        clipsMergedPath = await this.buildTimelineFromClips(
-          clipFiles,
-          timelineMeta,
-          id,
-          canvas,
-        );
+        clipsMergedPath = useCollage
+          ? await this.buildCollageFromClips(
+              clipFiles,
+              timelineMeta,
+              id,
+              canvas,
+              collageLayout!,
+            )
+          : await this.buildTimelineFromClips(
+              clipFiles,
+              timelineMeta,
+              id,
+              canvas,
+            );
         workPath = clipsMergedPath;
         cleanupMerged = true;
       } else if (this.isImageSource(inputPath, dto)) {
@@ -388,17 +411,24 @@ export class ShortsTranscodeService {
         exportVideoSuffix: exportSuffix,
       });
     const wantsWatermark = dto.watermark !== false;
-    const encodedPath = args.length === 0 ? workPath : outPath;
+    let encodedPath = args.length === 0 ? workPath : outPath;
       if (args.length > 0) {
         await this.runFfmpeg(args);
       }
+      const stickerLayers = normalizeStickerLayers(dto.stickers);
+      const stickerOut = path.join(os.tmpdir(), `eatix-sh-stk-${id}.mp4`);
+      if (stickerLayers.length) {
+        await this.applyStickers(encodedPath, stickerOut, stickerLayers, canvas);
+        encodedPath = stickerOut;
+      }
       if (!wantsWatermark) {
         if (encodedPath === wmPath) return wmPath;
-        if (encodedPath === outPath) return outPath;
+        if (encodedPath === outPath || encodedPath === stickerOut) return encodedPath;
         await fs.copyFile(encodedPath, wmPath);
         return wmPath;
       }
       await this.applyWatermark(encodedPath, wmPath);
+      if (encodedPath === stickerOut) await unlinkQuiet(stickerOut);
       return wmPath;
     } finally {
       await this.unlinkPaths(segmentPaths);
@@ -807,6 +837,223 @@ export class ShortsTranscodeService {
     } finally {
       await this.unlinkPaths(segs);
     }
+  }
+
+  private clipPlayDurationSec(meta: {
+    trimStartSec?: number;
+    trimEndSec?: number;
+    speedFactor?: number;
+    durationSec?: number;
+  }): number {
+    const speed = Math.max(0.25, Number(meta.speedFactor) || 1);
+    const ts = Number(meta.trimStartSec || 0);
+    const te = Number(meta.trimEndSec || meta.durationSec || 3);
+    const span = te > ts ? te - ts : Math.max(0.5, Number(meta.durationSec || 3));
+    return Math.max(0.05, span / speed);
+  }
+
+  private async buildCollageFromClips(
+    clipFiles: Express.Multer.File[],
+    clipsMeta: Array<{
+      fileIndex?: number;
+      type?: string;
+      trimStartSec?: number;
+      trimEndSec?: number;
+      speedFactor?: number;
+      durationSec?: number;
+      volume?: number;
+    }>,
+    id: string,
+    canvas: CanvasTarget,
+    layout: { id: string; slots: Array<{ x: number; y: number; w: number; h: number }>; maxVideos: number },
+  ): Promise<string> {
+    const pixels = layoutSlotPixels(layout, canvas.w, canvas.h, 8);
+    const used = clipsMeta.slice(0, pixels.length);
+    const durs = used.map((m) => this.clipPlayDurationSec(m));
+    const maxDur = Math.max(0.5, ...durs, 0.5);
+    const segs: string[] = [];
+    try {
+      for (let i = 0; i < pixels.length; i += 1) {
+        const slot = pixels[i];
+        const out = path.join(os.tmpdir(), `eatix-sh-slot-${id}-${i}.mp4`);
+        const meta = used[i];
+        const fileIdx = Number(meta?.fileIndex);
+        const file = Number.isFinite(fileIdx) ? clipFiles[fileIdx] : undefined;
+        const src = file?.path;
+        if (!src) {
+          await this.runFfmpeg([
+            '-y',
+            '-f',
+            'lavfi',
+            '-i',
+            `color=c=${(canvas.backgroundHex || '#000000').replace('#', '0x')}:s=${slot.w}x${slot.h}:d=${maxDur}:r=30`,
+            '-f',
+            'lavfi',
+            '-i',
+            `anullsrc=channel_layout=stereo:sample_rate=44100:d=${maxDur}`,
+            '-c:v',
+            'libx264',
+            '-pix_fmt',
+            'yuv420p',
+            '-c:a',
+            'aac',
+            '-shortest',
+            out,
+          ]);
+          segs.push(out);
+          continue;
+        }
+        const isPhoto =
+          String(meta.type || '').toLowerCase() === 'photo' ||
+          String(file?.mimetype || '').startsWith('image/');
+        await this.extractClipSegment(
+          src,
+          out,
+          meta,
+          isPhoto,
+          { w: slot.w, h: slot.h, fit: 'fill', backgroundHex: canvas.backgroundHex },
+        );
+        const dur = this.clipPlayDurationSec(meta);
+        if (maxDur - dur > 0.12) {
+          const padded = path.join(os.tmpdir(), `eatix-sh-slotpad-${id}-${i}.mp4`);
+          await this.runFfmpeg([
+            '-y',
+            '-i',
+            out,
+            '-vf',
+            `tpad=stop_mode=clone:stop_duration=${(maxDur - dur).toFixed(3)}`,
+            '-c:v',
+            'libx264',
+            '-pix_fmt',
+            'yuv420p',
+            '-an',
+            padded,
+          ]);
+          await fs.unlink(out);
+          segs.push(padded);
+        } else {
+          segs.push(out);
+        }
+      }
+      const merged = path.join(os.tmpdir(), `eatix-sh-collage-${id}.mp4`);
+      const inputs: string[] = [];
+      segs.forEach((p) => {
+        inputs.push('-i', p);
+      });
+      const labels = segs.map((_, i) => `[${i}:v]`).join('');
+      const layoutStr = xstackLayout(pixels);
+      const fill = (canvas.backgroundHex || '#000000').replace('#', '0x');
+      await this.runFfmpeg([
+        '-y',
+        ...inputs,
+        '-f',
+        'lavfi',
+        '-t',
+        String(maxDur),
+        '-i',
+        'anullsrc=channel_layout=stereo:sample_rate=44100',
+        '-filter_complex',
+        `${labels}xstack=inputs=${segs.length}:layout=${layoutStr}:fill=${fill}[v]`,
+        '-map',
+        '[v]',
+        '-map',
+        `${segs.length}:a`,
+        '-c:v',
+        'libx264',
+        '-pix_fmt',
+        'yuv420p',
+        '-c:a',
+        'aac',
+        '-shortest',
+        '-movflags',
+        '+faststart',
+        merged,
+      ]);
+      return merged;
+    } finally {
+      await this.unlinkPaths(segs);
+    }
+  }
+
+  private async resolveStickerPng(id: string): Promise<string | null> {
+    const file = `${id}.png`;
+    const candidates = [
+      path.join(process.cwd(), 'assets', 'stickers', file),
+      path.join(__dirname, '..', '..', 'assets', 'stickers', file),
+      path.join(__dirname, '..', '..', '..', 'assets', 'stickers', file),
+    ];
+    for (const p of candidates) {
+      try {
+        await fs.access(p);
+        return p;
+      } catch {
+        /* next */
+      }
+    }
+    return null;
+  }
+
+  private async applyStickers(
+    inPath: string,
+    outPath: string,
+    layers: StickerLayer[],
+    canvas: CanvasTarget,
+  ): Promise<void> {
+    const inputs: string[] = ['-y', '-i', inPath];
+    const resolved: Array<{ layer: StickerLayer; file: string; idx: number }> = [];
+    for (const layer of layers) {
+      const file = await this.resolveStickerPng(layer.catalogId);
+      if (!file) continue;
+      resolved.push({ layer, file, idx: resolved.length + 1 });
+      inputs.push('-i', file);
+    }
+    if (!resolved.length) {
+      await fs.copyFile(inPath, outPath);
+      return;
+    }
+    const filters: string[] = [];
+    let last = '[0:v]';
+    const baseW = Math.max(32, Math.round(canvas.w * 0.22));
+    resolved.forEach((item, i) => {
+      const w = Math.max(16, Math.round(baseW * item.layer.scale));
+      const evenW = w % 2 === 0 ? w : w + 1;
+      const rot = Number(item.layer.rotateDeg || 0);
+      const rotated = `[s${i}]`;
+      if (Math.abs(rot) > 0.5) {
+        const rad = ((rot % 360) * Math.PI) / 180;
+        filters.push(
+          `[${item.idx}:v]scale=${evenW}:-1,format=rgba,rotate=${rad.toFixed(4)}:c=none:ow=rotw(iw):oh=roth(ih)${rotated}`,
+        );
+      } else {
+        filters.push(`[${item.idx}:v]scale=${evenW}:-1,format=rgba${rotated}`);
+      }
+      const next = i === resolved.length - 1 ? '[vout]' : `[v${i}]`;
+      const en = `between(t,${item.layer.startSec.toFixed(3)},${item.layer.endSec.toFixed(3)})`;
+      filters.push(
+        `${last}${rotated}overlay=x='W*${item.layer.xPct.toFixed(4)}-w/2':y='H*${item.layer.yPct.toFixed(4)}-h/2':enable='${en}'${next}`,
+      );
+      last = next;
+    });
+    const hasAudio = await this.probeHasAudio(inPath);
+    const args = [
+      ...inputs,
+      '-filter_complex',
+      filters.join(';'),
+      '-map',
+      '[vout]',
+    ];
+    if (hasAudio) args.push('-map', '0:a', '-c:a', 'copy');
+    else args.push('-an');
+    args.push(
+      '-c:v',
+      'libx264',
+      '-pix_fmt',
+      'yuv420p',
+      '-movflags',
+      '+faststart',
+      outPath,
+    );
+    await this.runFfmpeg(args);
   }
 
   private normalizeSplitPoints(

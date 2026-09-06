@@ -421,6 +421,46 @@ export class CreateShortDto {
     durationSec?: number;
   }>;
 
+  @ApiPropertyOptional({
+    description: 'Composition: sequential (default) or collage',
+  })
+  @IsOptional()
+  @IsString()
+  composition?: string;
+
+  @ApiPropertyOptional({
+    description: 'Collage layout id: split-h-2 | split-v-2 | triple-top | grid-2x2',
+  })
+  @IsOptional()
+  @IsString()
+  layoutId?: string;
+
+  @ApiPropertyOptional({
+    description: 'Sticker layers (JSON array of catalog items)',
+    type: [Object],
+  })
+  @IsOptional()
+  @Transform(({ value }) => {
+    if (!value) return [];
+    if (Array.isArray(value)) return value;
+    try {
+      const parsed = JSON.parse(String(value));
+      return Array.isArray(parsed) ? parsed : [];
+    } catch {
+      return [];
+    }
+  })
+  @IsArray()
+  stickers?: Array<{
+    catalogId?: string;
+    xPct?: number;
+    yPct?: number;
+    scale?: number;
+    rotateDeg?: number;
+    startSec?: number;
+    endSec?: number;
+  }>;
+
   @ApiPropertyOptional({ description: 'Burn Eatwaze logo (default true)' })
   @IsOptional()
   @Transform(({ value }) => {
