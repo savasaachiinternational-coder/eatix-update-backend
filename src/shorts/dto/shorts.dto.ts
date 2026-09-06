@@ -57,6 +57,13 @@ export class CreateShortDto {
   @IsString()
   filterName?: string;
 
+  @ApiPropertyOptional({
+    description: 'Output aspect ratio (crop-to-fill): 9:16, 1:1, 4:5, or 16:9',
+  })
+  @IsOptional()
+  @IsString()
+  aspectRatio?: string;
+
   @ApiPropertyOptional({ description: 'Sound ID' })
   @IsOptional()
   @IsString()
