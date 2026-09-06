@@ -54,11 +54,32 @@ function buildOverlayColorGrade(hex: string, opacity: number): string {
   ].join(',');
 }
 
+/**
+ * 9:16, 1:1, 4:5, 16:9 → concrete pixel dims on a 1080-long-edge budget.
+ * 9:16 matches the historical hardcoded 1080x1920 canvas exactly, so
+ * treating an absent/'9:16' aspectRatio as a no-op preserves prior
+ * behavior for uploads that don't set it.
+ */
+const ASPECT_RATIO_DIMS: Record<string, { w: number; h: number }> = {
+  '9:16': { w: 1080, h: 1920 },
+  '1:1': { w: 1080, h: 1080 },
+  '4:5': { w: 1080, h: 1350 },
+  '16:9': { w: 1920, h: 1080 },
+};
+
+export function resolveExportDimsForAspectRatio(
+  aspectRatio?: string | null,
+): { w: number; h: number } | null {
+  const key = String(aspectRatio || '').trim();
+  return ASPECT_RATIO_DIMS[key] || null;
+}
+
 export function shortsShouldTranscode(dto: {
   soundUrl?: string;
   beautyLevel?: number;
   speedFactor?: number;
   filterId?: string;
+  aspectRatio?: string;
   trimStartSec?: number;
   trimEndSec?: number;
   /** Client-reported source duration (seconds); used to detect real trim vs full-range defaults. */
@@ -78,6 +99,8 @@ export function shortsShouldTranscode(dto: {
   if (process.env.SHORTS_DISABLE_FFMPEG === '1') return false;
   if (dto.watermark !== false) return true;
   if (Array.isArray(dto.clips) && dto.clips.length > 1) return true;
+  const ar = String(dto.aspectRatio || '').trim();
+  if (ar && ar !== '9:16') return true;
   const sound = dto.soundUrl != null && String(dto.soundUrl).trim().length > 0;
   if (sound) return true;
   const beauty = dto.beautyLevel != null && Number(dto.beautyLevel) > 0;
