@@ -54,24 +54,176 @@ function buildOverlayColorGrade(hex: string, opacity: number): string {
   ].join(',');
 }
 
-/**
- * 9:16, 1:1, 4:5, 16:9 → concrete pixel dims on a 1080-long-edge budget.
- * 9:16 matches the historical hardcoded 1080x1920 canvas exactly, so
- * treating an absent/'9:16' aspectRatio as a no-op preserves prior
- * behavior for uploads that don't set it.
- */
-const ASPECT_RATIO_DIMS: Record<string, { w: number; h: number }> = {
-  '9:16': { w: 1080, h: 1920 },
-  '1:1': { w: 1080, h: 1080 },
-  '4:5': { w: 1080, h: 1350 },
-  '16:9': { w: 1920, h: 1080 },
+export type CanvasFit = 'fill' | 'fit';
+export type CanvasQuality = '720p' | '1080p';
+export type CanvasRatio = '9:16' | '1:1' | '4:5' | '16:9';
+
+export type CanvasTarget = {
+  w: number;
+  h: number;
+  fit: CanvasFit;
+  backgroundHex: string;
 };
 
+/** Must match Ethics-app `src/constants/canvasSpec.js` CANVAS_DIMS. */
+const CANVAS_DIMS: Record<
+  CanvasQuality,
+  Record<CanvasRatio, { w: number; h: number }>
+> = {
+  '720p': {
+    '9:16': { w: 720, h: 1280 },
+    '1:1': { w: 720, h: 720 },
+    '4:5': { w: 720, h: 900 },
+    '16:9': { w: 1280, h: 720 },
+  },
+  '1080p': {
+    '9:16': { w: 1080, h: 1920 },
+    '1:1': { w: 1080, h: 1080 },
+    '4:5': { w: 1080, h: 1350 },
+    '16:9': { w: 1920, h: 1080 },
+  },
+};
+
+function evenPx(n: number): number {
+  const x = Math.max(2, Math.round(Number(n) || 0));
+  return x % 2 === 0 ? x : x + 1;
+}
+
+export function parseCanvasRatio(raw?: string | null): CanvasRatio {
+  const key = String(raw || '').trim();
+  if (key === '1:1' || key === '4:5' || key === '16:9' || key === '9:16') {
+    return key;
+  }
+  return '9:16';
+}
+
+export function parseCanvasQuality(raw?: string | null): CanvasQuality {
+  const s = String(raw || '')
+    .trim()
+    .toLowerCase();
+  if (s === '720p' || s === '720x1280') return '720p';
+  if (s === '1080p' || s === '1080x1920') return '1080p';
+  return '1080p';
+}
+
+export function parseCanvasFit(raw?: string | null): CanvasFit {
+  return String(raw || '')
+    .trim()
+    .toLowerCase() === 'fit'
+    ? 'fit'
+    : 'fill';
+}
+
+export function normalizeBackgroundHex(
+  raw?: string | null,
+  fallback = '#000000',
+): string {
+  const s = String(raw || '').trim();
+  const m = s.match(/^#?([0-9A-Fa-f]{6})$/);
+  if (!m) return fallback;
+  return `#${m[1].toUpperCase()}`;
+}
+
+export function ffmpegPadColor(hex: string): string {
+  const n = normalizeBackgroundHex(hex).slice(1);
+  return `0x${n}`;
+}
+
+export function resolveCanvasDims(
+  aspectRatio?: string | null,
+  quality?: string | null,
+): { w: number; h: number } {
+  const ratio = parseCanvasRatio(aspectRatio);
+  const q = parseCanvasQuality(quality);
+  const dims = CANVAS_DIMS[q][ratio];
+  return { w: evenPx(dims.w), h: evenPx(dims.h) };
+}
+
+/**
+ * 1080p table only — kept for callers that have a ratio and no quality.
+ */
 export function resolveExportDimsForAspectRatio(
   aspectRatio?: string | null,
 ): { w: number; h: number } | null {
   const key = String(aspectRatio || '').trim();
-  return ASPECT_RATIO_DIMS[key] || null;
+  if (!key) return null;
+  if (key !== '9:16' && key !== '1:1' && key !== '4:5' && key !== '16:9') {
+    return null;
+  }
+  return resolveCanvasDims(key, '1080p');
+}
+
+function inferQualityFromDims(w: number, h: number): CanvasQuality {
+  const long = Math.max(w, h);
+  if (long > 0 && long <= 800) return '720p';
+  return '1080p';
+}
+
+/**
+ * Preview and export share this. Default fit is fill (cover/crop), matching
+ * the RN `resizeMode="cover"` preview. Old clients sent 9:16 quality pixels
+ * even for 1:1 — those 720x1280 / 1080x1920 pairs are ignored when the
+ * ratio is not 9:16.
+ */
+export function resolveCanvasFromDto(dto: {
+  aspectRatio?: string | null;
+  exportWidth?: number | null;
+  exportHeight?: number | null;
+  exportQuality?: string | null;
+  canvasFit?: string | null;
+  backgroundColor?: string | null;
+}): CanvasTarget {
+  const ratio = parseCanvasRatio(dto.aspectRatio);
+  const ew = Number(dto.exportWidth || 0);
+  const eh = Number(dto.exportHeight || 0);
+  const looksLike916Preset =
+    (ew === 720 && eh === 1280) || (ew === 1080 && eh === 1920);
+  const quality =
+    dto.exportQuality != null && String(dto.exportQuality).trim()
+      ? parseCanvasQuality(dto.exportQuality)
+      : inferQualityFromDims(ew, eh);
+  const table = resolveCanvasDims(ratio, quality);
+  let w = table.w;
+  let h = table.h;
+  if (ew > 0 && eh > 0 && !(looksLike916Preset && ratio !== '9:16')) {
+    w = evenPx(ew);
+    h = evenPx(eh);
+  }
+  return {
+    w,
+    h,
+    fit: parseCanvasFit(dto.canvasFit),
+    backgroundHex: normalizeBackgroundHex(dto.backgroundColor),
+  };
+}
+
+export function buildCanvasVideoFilter(opts: {
+  width: number;
+  height: number;
+  fit?: CanvasFit;
+  backgroundHex?: string;
+  fps?: number | null;
+}): string {
+  const w = evenPx(opts.width);
+  const h = evenPx(opts.height);
+  const fit = opts.fit === 'fit' ? 'fit' : 'fill';
+  const parts: string[] = [];
+  if (fit === 'fill') {
+    parts.push(
+      `scale=${w}:${h}:force_original_aspect_ratio=increase`,
+      `crop=${w}:${h}:(iw-${w})/2:(ih-${h})/2`,
+    );
+  } else {
+    parts.push(
+      `scale=${w}:${h}:force_original_aspect_ratio=decrease`,
+      `pad=${w}:${h}:(ow-iw)/2:(oh-ih)/2:${ffmpegPadColor(opts.backgroundHex || '#000000')}`,
+    );
+  }
+  if (opts.fps != null && Number(opts.fps) > 0) {
+    parts.push(`fps=${Number(opts.fps)}`);
+  }
+  parts.push('setsar=1', 'format=yuv420p');
+  return parts.join(',');
 }
 
 export function shortsShouldTranscode(dto: {
@@ -93,6 +245,9 @@ export function shortsShouldTranscode(dto: {
   exportWidth?: number;
   exportHeight?: number;
   exportFps?: number;
+  exportQuality?: string;
+  canvasFit?: string;
+  backgroundColor?: string;
   clips?: Array<{ fileIndex?: number; type?: string }>;
   watermark?: boolean;
 }): boolean {
@@ -101,6 +256,9 @@ export function shortsShouldTranscode(dto: {
   if (Array.isArray(dto.clips) && dto.clips.length > 1) return true;
   const ar = String(dto.aspectRatio || '').trim();
   if (ar && ar !== '9:16') return true;
+  if (parseCanvasFit(dto.canvasFit) === 'fit') return true;
+  const bg = normalizeBackgroundHex(dto.backgroundColor);
+  if (bg !== '#000000') return true;
   const sound = dto.soundUrl != null && String(dto.soundUrl).trim().length > 0;
   if (sound) return true;
   const beauty = dto.beautyLevel != null && Number(dto.beautyLevel) > 0;

@@ -14,6 +14,7 @@ cross-repo CI. Follow it exactly when touching a synced file.
 | Ethics-app | This repo (eatix-backend) | What it defines |
 |---|---|---|
 | `src/constants/filter-preset-spec.json` | `src/shorts/filter-preset-spec.json` | Filter/theme id → color-grade `{hex, opacity}` |
+| `src/constants/canvasSpec.js` `CANVAS_DIMS` | `src/shorts/shorts-ffmpeg-presets.ts` `CANVAS_DIMS` | Quality × ratio → even pixel size, default fill |
 
 (Future additions — sticker catalog, collage layouts — should follow the
 same pattern and be added to this table.)

@@ -58,11 +58,32 @@ export class CreateShortDto {
   filterName?: string;
 
   @ApiPropertyOptional({
-    description: 'Output aspect ratio (crop-to-fill): 9:16, 1:1, 4:5, or 16:9',
+    description: 'Output aspect ratio: 9:16, 1:1, 4:5, or 16:9',
   })
   @IsOptional()
   @IsString()
   aspectRatio?: string;
+
+  @ApiPropertyOptional({
+    description: 'Canvas fit: fill (cover/crop, default) or fit (contain + background)',
+  })
+  @IsOptional()
+  @IsString()
+  canvasFit?: string;
+
+  @ApiPropertyOptional({
+    description: 'Canvas background hex (used when canvasFit=fit), e.g. #000000',
+  })
+  @IsOptional()
+  @IsString()
+  backgroundColor?: string;
+
+  @ApiPropertyOptional({
+    description: 'Quality class: 720p or 1080p (also accepts legacy 720x1280 / 1080x1920)',
+  })
+  @IsOptional()
+  @IsString()
+  exportQuality?: string;
 
   @ApiPropertyOptional({ description: 'Sound ID' })
   @IsOptional()

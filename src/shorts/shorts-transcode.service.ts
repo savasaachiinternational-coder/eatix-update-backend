@@ -7,8 +7,10 @@ import * as os from 'os';
 import { CreateShortDto } from './dto/shorts.dto';
 import {
   buildAtempoChain,
+  buildCanvasVideoFilter,
   buildShortsVideoFilters,
-  resolveExportDimsForAspectRatio,
+  resolveCanvasFromDto,
+  type CanvasTarget,
 } from './shorts-ffmpeg-presets';
 
 async function unlinkQuiet(p: string | null | undefined) {
@@ -137,7 +139,8 @@ export class ShortsTranscodeService {
         dto.exportFps,
         workMeta.width,
         workMeta.height,
-        exportTarget.cropToFill,
+        exportTarget.fit !== 'fit',
+        exportTarget.backgroundHex,
       );
       if (
         Array.isArray(dto.overlayItems) &&
@@ -244,8 +247,7 @@ export class ShortsTranscodeService {
                   : 'video',
               }))
             : [];
-      const canvasDims =
-        resolveExportDimsForAspectRatio(dto.aspectRatio) || undefined;
+      const canvas = resolveCanvasFromDto(dto);
       if (timelineMeta.length > 0 && clipFiles.length > 0) {
         this.logger.log(
           `Joining ${timelineMeta.length} clip(s) from ${clipFiles.length} file(s) into one video`,
@@ -254,7 +256,7 @@ export class ShortsTranscodeService {
           clipFiles,
           timelineMeta,
           id,
-          canvasDims,
+          canvas,
         );
         workPath = clipsMergedPath;
         cleanupMerged = true;
@@ -264,7 +266,7 @@ export class ShortsTranscodeService {
           Number(dto.trimEndSec || dto.duration || 3) -
             Number(dto.trimStartSec || 0) || 3,
         );
-        await this.stillToVideo(inputPath, stillPath, dur, canvasDims);
+        await this.stillToVideo(inputPath, stillPath, dur, canvas);
         workPath = stillPath;
         cleanupStill = true;
       }
@@ -345,7 +347,8 @@ export class ShortsTranscodeService {
         dto.exportFps,
         workMeta.width,
         workMeta.height,
-        exportTarget.cropToFill,
+        exportTarget.fit !== 'fit',
+        exportTarget.backgroundHex,
       );
       if (
         Array.isArray(dto.overlayItems) &&
@@ -621,22 +624,23 @@ export class ShortsTranscodeService {
     return String(first?.type || '').toLowerCase() === 'photo';
   }
 
-  /** Default 1080x1920 (9:16) matches the historical hardcoded canvas. */
-  private clipCanvasFilter(w = 1080, h = 1920): string {
-    return [
-      `scale=${w}:${h}:force_original_aspect_ratio=decrease`,
-      `pad=${w}:${h}:(ow-iw)/2:(oh-ih)/2:black`,
-      'fps=30',
-      'setsar=1',
-      'format=yuv420p',
-    ].join(',');
+  private clipCanvasFilter(canvas?: Partial<CanvasTarget> | null): string {
+    const w = canvas?.w || 1080;
+    const h = canvas?.h || 1920;
+    return buildCanvasVideoFilter({
+      width: w,
+      height: h,
+      fit: canvas?.fit === 'fit' ? 'fit' : 'fill',
+      backgroundHex: canvas?.backgroundHex || '#000000',
+      fps: 30,
+    });
   }
 
   private async stillToVideo(
     imagePath: string,
     outPath: string,
     durationSec: number,
-    dims?: { w: number; h: number },
+    canvas?: Partial<CanvasTarget>,
   ): Promise<void> {
     const dur = Math.max(0.05, Math.min(32, Number(durationSec) || 3));
     await this.runFfmpeg([
@@ -654,7 +658,7 @@ export class ShortsTranscodeService {
       '-i',
       'anullsrc=channel_layout=stereo:sample_rate=44100',
       '-vf',
-      this.clipCanvasFilter(dims?.w, dims?.h),
+      this.clipCanvasFilter(canvas),
       '-c:v',
       'libx264',
       '-preset',
@@ -690,7 +694,7 @@ export class ShortsTranscodeService {
       volume?: number;
     },
     isPhoto: boolean,
-    dims?: { w: number; h: number },
+    canvas?: Partial<CanvasTarget>,
   ): Promise<void> {
     if (isPhoto) {
       const dur = Math.max(
@@ -699,7 +703,7 @@ export class ShortsTranscodeService {
           Number(meta.trimStartSec || 0)) /
           Math.max(0.25, Number(meta.speedFactor) || 1),
       );
-      await this.stillToVideo(inputPath, outPath, dur, dims);
+      await this.stillToVideo(inputPath, outPath, dur, canvas);
       return;
     }
     const ts = Number(meta.trimStartSec || 0);
@@ -712,7 +716,7 @@ export class ShortsTranscodeService {
     const outDur = Math.max(0.05, span / speed);
     const vfParts = [];
     if (Math.abs(speed - 1) > 0.001) vfParts.push(`setpts=PTS/${speed}`);
-    vfParts.push(this.clipCanvasFilter(dims?.w, dims?.h));
+    vfParts.push(this.clipCanvasFilter(canvas));
     const vf = vfParts.join(',');
     const hasAudio = await this.probeHasAudio(inputPath);
     const args: string[] = ['-y'];
@@ -773,7 +777,7 @@ export class ShortsTranscodeService {
       volume?: number;
     }>,
     id: string,
-    dims?: { w: number; h: number },
+    canvas?: Partial<CanvasTarget>,
   ): Promise<string> {
     const segs: string[] = [];
     try {
@@ -787,7 +791,7 @@ export class ShortsTranscodeService {
           String(meta.type || '').toLowerCase() === 'photo' ||
           String(file?.mimetype || '').startsWith('image/');
         const out = path.join(os.tmpdir(), `eatix-sh-clip-${id}-${i}.mp4`);
-        await this.extractClipSegment(src, out, meta, isPhoto, dims);
+        await this.extractClipSegment(src, out, meta, isPhoto, canvas);
         segs.push(out);
       }
       if (!segs.length) {
@@ -1047,33 +1051,20 @@ export class ShortsTranscodeService {
     await this.runFfmpeg(args);
   }
 
-  /**
-   * Explicit exportWidth/exportHeight (quality-preset flow) always win and
-   * keep the existing pad/letterbox behavior unchanged. When only an
-   * aspectRatio is given, dims are resolved from it and cropped-to-fill
-   * instead, matching the client's `resizeMode="cover"` preview.
-   */
   private resolveEffectiveExportTarget(dto: {
     exportWidth?: number;
     exportHeight?: number;
     aspectRatio?: string;
-  }): { w?: number; h?: number; cropToFill: boolean } {
-    if (dto.exportWidth != null || dto.exportHeight != null) {
-      return { w: dto.exportWidth, h: dto.exportHeight, cropToFill: false };
-    }
-    const aspectDims = resolveExportDimsForAspectRatio(dto.aspectRatio);
-    if (aspectDims) {
-      return { w: aspectDims.w, h: aspectDims.h, cropToFill: true };
-    }
-    return { w: undefined, h: undefined, cropToFill: false };
+    exportQuality?: string;
+    canvasFit?: string;
+    backgroundColor?: string;
+  }): CanvasTarget {
+    return resolveCanvasFromDto(dto);
   }
 
   /**
-   * `cropToFill`: pad (letterbox, default — preserves the whole frame with
-   * black bars) vs crop (fills the target frame exactly, cutting off the
-   * excess — used when the target dims come from an explicit aspectRatio
-   * choice rather than a quality-preset resolution, matching the client's
-   * `resizeMode="cover"` preview).
+   * `cropToFill` (fit=fill): cover/crop. `fit`: contain + pad with background.
+   * Matches the editor preview resizeMode cover vs contain.
    */
   private buildExportVideoSuffix(
     w?: number,
@@ -1081,7 +1072,8 @@ export class ShortsTranscodeService {
     fps?: number,
     srcW?: number,
     srcH?: number,
-    cropToFill = false,
+    cropToFill = true,
+    backgroundHex = '#000000',
   ): string {
     const targetW = w != null && Number(w) > 0 ? Math.round(Number(w)) : 0;
     const targetH = h != null && Number(h) > 0 ? Math.round(Number(h)) : 0;
@@ -1095,17 +1087,14 @@ export class ShortsTranscodeService {
         Math.abs(srcW - targetW) / targetW < 0.03 &&
         Math.abs(srcH - targetH) / targetH < 0.03;
       if (!nearly) {
-        if (cropToFill) {
-          parts.push(
-            `scale=${targetW}:${targetH}:force_original_aspect_ratio=increase`,
-            `crop=${targetW}:${targetH}:(iw-${targetW})/2:(ih-${targetH})/2`,
-          );
-        } else {
-          parts.push(
-            `scale=${targetW}:${targetH}:force_original_aspect_ratio=decrease`,
-            `pad=${targetW}:${targetH}:(ow-iw)/2:(oh-ih)/2:black`,
-          );
-        }
+        parts.push(
+          buildCanvasVideoFilter({
+            width: targetW,
+            height: targetH,
+            fit: cropToFill ? 'fill' : 'fit',
+            backgroundHex,
+          }),
+        );
       }
     }
     if (targetFps > 0) {
