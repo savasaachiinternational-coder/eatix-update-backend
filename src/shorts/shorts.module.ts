@@ -1,3 +1,4 @@
+import { EditorController } from './editor.controller';
 import { Module } from '@nestjs/common';
 import { HttpModule } from '@nestjs/axios';
 import { ShortsController } from './shorts.controller';
@@ -23,7 +24,7 @@ import { NoLogoCreditsModule } from '../no-logo-credits/no-logo-credits.module';
     ScheduledContentModule,
     NoLogoCreditsModule,
   ],
-  controllers: [ShortsController],
+  controllers: [ShortsController, EditorController],
   providers: [ShortsService, ShortsTranscodeService],
   exports: [ShortsService],
 })

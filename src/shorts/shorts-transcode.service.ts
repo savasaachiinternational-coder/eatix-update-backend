@@ -1,3 +1,4 @@
+import { buildClipVisualFilter, ClipVisual } from './shorts-clip-visual';
 import { BadRequestException, Injectable, Logger } from '@nestjs/common';
 import { HttpService } from '@nestjs/axios';
 import { spawn } from 'child_process';
@@ -671,6 +672,7 @@ export class ShortsTranscodeService {
     outPath: string,
     durationSec: number,
     canvas?: Partial<CanvasTarget>,
+    visual: ClipVisual = {},
   ): Promise<void> {
     const dur = Math.max(0.05, Math.min(32, Number(durationSec) || 3));
     await this.runFfmpeg([
@@ -688,7 +690,7 @@ export class ShortsTranscodeService {
       '-i',
       'anullsrc=channel_layout=stereo:sample_rate=44100',
       '-vf',
-      this.clipCanvasFilter(canvas),
+      `${buildClipVisualFilter(visual, canvas)},fps=30`,
       '-c:v',
       'libx264',
       '-preset',
@@ -716,6 +718,8 @@ export class ShortsTranscodeService {
     inputPath: string,
     outPath: string,
     meta: {
+      transform?: Record<string, unknown>;
+      adjustments?: Record<string, unknown>;
       type?: string;
       trimStartSec?: number;
       trimEndSec?: number;
@@ -733,7 +737,7 @@ export class ShortsTranscodeService {
           Number(meta.trimStartSec || 0)) /
           Math.max(0.25, Number(meta.speedFactor) || 1),
       );
-      await this.stillToVideo(inputPath, outPath, dur, canvas);
+      await this.stillToVideo(inputPath, outPath, dur, canvas, meta);
       return;
     }
     const ts = Number(meta.trimStartSec || 0);
@@ -746,7 +750,7 @@ export class ShortsTranscodeService {
     const outDur = Math.max(0.05, span / speed);
     const vfParts = [];
     if (Math.abs(speed - 1) > 0.001) vfParts.push(`setpts=PTS/${speed}`);
-    vfParts.push(this.clipCanvasFilter(canvas));
+    vfParts.push(`${buildClipVisualFilter(meta, canvas)},fps=30`);
     const vf = vfParts.join(',');
     const hasAudio = await this.probeHasAudio(inputPath);
     const args: string[] = ['-y'];
@@ -799,6 +803,8 @@ export class ShortsTranscodeService {
     clipFiles: Express.Multer.File[],
     clipsMeta: Array<{
       fileIndex?: number;
+      transform?: Record<string, unknown>;
+      adjustments?: Record<string, unknown>;
       type?: string;
       trimStartSec?: number;
       trimEndSec?: number;
@@ -856,6 +862,8 @@ export class ShortsTranscodeService {
     clipFiles: Express.Multer.File[],
     clipsMeta: Array<{
       fileIndex?: number;
+      transform?: Record<string, unknown>;
+      adjustments?: Record<string, unknown>;
       type?: string;
       trimStartSec?: number;
       trimEndSec?: number;
@@ -1452,6 +1460,7 @@ export class ShortsTranscodeService {
       endSec?: number;
       rotateDeg?: number;
       shadowPreset?: string;
+      backgroundColor?: string;
       anchor?: string;
     }>;
     subtitlesAssPath?: string | null;
@@ -1847,6 +1856,7 @@ export class ShortsTranscodeService {
       endSec?: number;
       rotateDeg?: number;
       shadowPreset?: string;
+      backgroundColor?: string;
       anchor?: string;
     }>;
     width: number;
@@ -1891,6 +1901,7 @@ export class ShortsTranscodeService {
       '[V4+ Styles]',
       'Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding',
       'Style: Default,DejaVu Sans,36,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,1,2,10,10,80,1',
+      'Style: Card,DejaVu Sans,36,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,3,8,0,2,10,10,80,1',
       '',
       '[Events]',
       'Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text',
@@ -1912,7 +1923,7 @@ export class ShortsTranscodeService {
       const yPct = Math.max(0, Math.min(1, yPctRaw));
       const px = Math.round(width * xPct);
       const py = Math.round(height * yPct);
-      const fs = Math.max(12, Math.min(96, Math.round(Number(item?.size || 36))));
+      const fs = Math.max(12, Math.min(320, Math.round(Number(item?.size || 36))));
       const ls = Number(item?.startSec ?? 0);
       const le = Number(item?.endSec ?? durationSec);
       const visStart = Math.max(ls, trimS);
@@ -1927,12 +1938,14 @@ export class ShortsTranscodeService {
         Number.isFinite(rot) && Math.abs(rot) > 0.05
           ? `\\frz${(-rot).toFixed(2)}`
           : '';
-      const shadow = this.assShadowTags(item?.shadowPreset);
+      const background = /^#[0-9a-f]{6}$/i.test(item.backgroundColor || '')
+        ? `{\\3c${this.hexToAssPrimaryColour(item.backgroundColor!)}\\4c${this.hexToAssPrimaryColour(item.backgroundColor!)}\\bord8\\shad0\\3a&H00&}` : '';
+      const shadow = background ? '\\bord8\\shad0' : this.assShadowTags(item?.shadowPreset);
       const an = this.assAnFromAnchor(item?.anchor);
       const tags = `{\\an${an}\\pos(${px},${py})\\fs${fs}\\c${colour}${frz}${shadow}}`;
       const escaped = this.escapeAssText(text);
       lines.push(
-        `Dialogue: ${layerOrder},${this.formatAssTime(assStart)},${this.formatAssTime(assEnd)},Default,,0,0,0,,${tags}${escaped}`,
+        `Dialogue: ${layerOrder},${this.formatAssTime(assStart)},${this.formatAssTime(assEnd)},${background ? 'Card' : 'Default'},,0,0,0,,${background}${tags}${escaped}`,
       );
       layerOrder += 1;
     }

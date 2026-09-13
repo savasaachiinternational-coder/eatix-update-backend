@@ -305,6 +305,7 @@ export class CreateShortDto {
     /** Rotation in degrees (exported via ASS \\frz). */
     rotateDeg?: number;
     /** none | soft | hard — drawtext box and ASS outline/shadow. */
+    backgroundColor?: string;
     shadowPreset?: string;
     /** Text anchor: tl|tc|tr|cl|cc|cr|bl|bc|br — matches app preview and ASS \\an. */
     anchor?: string;
@@ -412,6 +413,8 @@ export class CreateShortDto {
   })
   @IsArray()
   clips?: Array<{
+    transform?: Record<string, unknown>;
+    adjustments?: Record<string, unknown>;
     fileIndex?: number;
     type?: string;
     trimStartSec?: number;
