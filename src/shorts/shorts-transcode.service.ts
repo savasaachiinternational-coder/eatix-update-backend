@@ -545,14 +545,14 @@ export class ShortsTranscodeService {
     const hasAudio = await this.probeHasAudio(inPath);
     const rotation = await this.probeDisplayRotationDeg(inPath);
     const orient = this.orientationFilterPrefix(rotation);
-    // Exact middle-center — logo only (transparent PNG, no box/border).
-    // Must stay centered on the published file (not only create-preview UI).
+    // Small top-right wordmark — matches editor preview. Insets keep it
+    // off the status bar / cover crop. Logo only (transparent PNG, no box).
     const overlay =
       `[0:v]${orient}format=yuv420p[base];` +
-      '[1:v]scale=280:-1,format=rgba[wm];' +
-      '[base][wm]overlay=(W-w)/2:(H-h)/2';
+      '[1:v]scale=140:-1,format=rgba[wm];' +
+      '[base][wm]overlay=W-w-40:48';
     this.logger.log(
-      `Burning Eatwaze watermark CENTER (rotation=${rotation}° logo=${logo || 'drawtext'})`,
+      `Burning Eatwaze watermark TOP-RIGHT (rotation=${rotation}° logo=${logo || 'drawtext'})`,
     );
     if (logo) {
       try {
@@ -583,7 +583,7 @@ export class ShortsTranscodeService {
           'rotate=0',
           outPath,
         ]);
-        this.logger.log('Eatwaze CENTER watermark applied to video');
+        this.logger.log('Eatwaze TOP-RIGHT watermark applied to video');
         return;
       } catch (e) {
         this.logger.warn(
@@ -591,8 +591,8 @@ export class ShortsTranscodeService {
         );
       }
     }
-    // Text fallback: no box — just the wordmark, centered.
-    const textVf = `${orient}drawtext=text='eatwaze':fontcolor=white:fontsize=42:x=(w-text_w)/2:y=(h-text_h)/2`;
+    // Text fallback: no box — small wordmark, top-right.
+    const textVf = `${orient}drawtext=text='eatwaze':fontcolor=white:fontsize=22:x=w-text_w-40:y=48`;
     await this.runFfmpeg([
       '-y',
       '-noautorotate',
@@ -617,7 +617,7 @@ export class ShortsTranscodeService {
       'rotate=0',
       outPath,
     ]);
-    this.logger.log('Eatwaze CENTER text watermark applied to video');
+    this.logger.log('Eatwaze TOP-RIGHT text watermark applied to video');
   }
 
   async applyWatermarkToImage(inPath: string, outPath: string): Promise<void> {
@@ -628,7 +628,7 @@ export class ShortsTranscodeService {
     }
     const rotation = await this.probeDisplayRotationDeg(inPath);
     const orient = this.orientationFilterPrefix(rotation);
-    this.logger.log(`Burning Eatwaze watermark CENTER on image (rotation=${rotation}°)`);
+    this.logger.log(`Burning Eatwaze watermark TOP-RIGHT on image (rotation=${rotation}°)`);
     await this.runFfmpeg([
       '-y',
       '-noautorotate',
@@ -638,8 +638,8 @@ export class ShortsTranscodeService {
       logo,
       '-filter_complex',
       `[0:v]${orient}format=rgba[base];` +
-        '[1:v]scale=220:-1,format=rgba[wm];' +
-        '[base][wm]overlay=(W-w)/2:(H-h)/2',
+        '[1:v]scale=120:-1,format=rgba[wm];' +
+        '[base][wm]overlay=W-w-36:40',
       '-frames:v',
       '1',
       '-q:v',
