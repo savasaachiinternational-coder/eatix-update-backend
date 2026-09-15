@@ -546,10 +546,10 @@ export class ShortsTranscodeService {
     const rotation = await this.probeDisplayRotationDeg(inPath);
     const orient = this.orientationFilterPrefix(rotation);
     // Small top-right wordmark — matches editor preview. Insets keep it
-    // off the status bar / cover crop. Logo only (transparent PNG, no box).
+    // off the status bar / cover crop. Soft alpha so it does not dominate.
     const overlay =
       `[0:v]${orient}format=yuv420p[base];` +
-      '[1:v]scale=140:-1,format=rgba[wm];' +
+      '[1:v]scale=140:-1,format=rgba,colorchannelmixer=aa=0.5[wm];' +
       '[base][wm]overlay=W-w-40:48';
     this.logger.log(
       `Burning Eatwaze watermark TOP-RIGHT (rotation=${rotation}° logo=${logo || 'drawtext'})`,
@@ -591,8 +591,8 @@ export class ShortsTranscodeService {
         );
       }
     }
-    // Text fallback: no box — small wordmark, top-right.
-    const textVf = `${orient}drawtext=text='eatwaze':fontcolor=white:fontsize=22:x=w-text_w-40:y=48`;
+    // Text fallback: no box — small wordmark, top-right, same 50% opacity.
+    const textVf = `${orient}drawtext=text='eatwaze':fontcolor=white@0.5:fontsize=22:x=w-text_w-40:y=48`;
     await this.runFfmpeg([
       '-y',
       '-noautorotate',
@@ -638,7 +638,7 @@ export class ShortsTranscodeService {
       logo,
       '-filter_complex',
       `[0:v]${orient}format=rgba[base];` +
-        '[1:v]scale=120:-1,format=rgba[wm];' +
+        '[1:v]scale=120:-1,format=rgba,colorchannelmixer=aa=0.5[wm];' +
         '[base][wm]overlay=W-w-36:40',
       '-frames:v',
       '1',
