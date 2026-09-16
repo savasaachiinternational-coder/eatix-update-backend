@@ -8,6 +8,8 @@ datasource db {
 }
 
 model User {
+  faceLoginDevices FaceLoginDevice[]
+  faceLoginAttempts FaceLoginAttempt[]
   id            String       @id @default(uuid())
   name          String?
   nickname      String?      // User's nickname (channel display name)
@@ -207,6 +209,40 @@ model User {
 
   @@index([email])
   @@index([subscriptionPackageId])
+}
+
+// Face templates are encrypted; camera images are never stored.
+model FaceLoginDevice {
+  id String @id @default(uuid())
+  userId String
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  secretHash String
+  templateCipher String
+  modelVersion String
+  attempts Int @default(0)
+  windowStartedAt DateTime @default(now())
+  createdAt DateTime @default(now())
+  @@index([userId])
+}
+
+model FaceLoginAttempt {
+  id String @id @default(uuid())
+  userId String
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  deviceId String?
+  secretHash String
+  mode String
+  directions String[]
+  step Int @default(0)
+  frames Int @default(0)
+  frameHashes String[]
+  samplesCipher String?
+  processing Boolean @default(false)
+  completed Boolean @default(false)
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+  @@index([userId, createdAt])
+  @@index([expiresAt])
 }
 
 // Paid packs that grant no-logo upload credits (consumable)

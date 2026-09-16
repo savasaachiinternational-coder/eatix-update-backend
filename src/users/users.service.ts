@@ -81,6 +81,7 @@ export class UsersService {
       roleId: activeUser.roleId,
       employeeId: activeUser.employeeId,
       pin: activeUser.pin ? true : false,
+      fingerprintEnabled: activeUser.fingerprintEnabled ?? false,
       photos: activeUser.photos ?? [],
       channelAbout: activeUser.channelAbout ?? undefined,
       socialLinks: activeUser.socialLinks ?? undefined,
@@ -159,6 +160,18 @@ export class UsersService {
       token: this.signAuthToken(activeUser),
       user: this.mapAppAuthUser(activeUser),
     };
+  }
+
+  async completeFaceLogin(userId: string, requireEnabled = false) {
+    const user = await this.loadAuthUserById(userId);
+    if (!user) throw new UnauthorizedException('User not found');
+    if (requireEnabled && !user.fingerprintEnabled) {
+      throw new UnauthorizedException('Face login is disabled. Log in with your password.');
+    }
+    const activeUser = await this.ensureAppUserCanLogin(user, {
+      branch: true, permissions: true, roleModel: true, clientBusiness: true,
+    });
+    return { token: this.signAuthToken(activeUser), user: this.mapAppAuthUser(activeUser) };
   }
 
   private normalizeEmail(email: string): string {
