@@ -161,6 +161,27 @@ describe('camera face login authorization', () => {
     expect(users.completeFaceLogin).not.toHaveBeenCalled();
   });
 
+  it('retries an inconsistent enrollment frame without saving it or ending registration', async () => {
+    await frame(0);
+    const savedSamples = attempt.samplesCipher;
+    engine.analyze.mockResolvedValueOnce({
+      ...observation(0.3),
+      embedding: Array(128).fill(20),
+    });
+    const retry = await frame(1);
+    expect(retry.verified).toBe(false);
+    expect(retry.instruction).toContain('Keep the same person');
+    expect(attempt.step).toBe(1);
+    expect(attempt.completed).toBe(false);
+    expect(attempt.samplesCipher).toBe(savedSamples);
+    expect(prisma.faceLoginDevice.create).not.toHaveBeenCalled();
+    for (const [index, yaw] of [0.3, -0.3, 0].entries()) {
+      engine.analyze.mockResolvedValueOnce(observation(yaw));
+      const result = await frame(index + 2);
+      expect(result.verified).toBe(index === 2);
+    }
+  });
+
   it('does not advance when liveness checks fail', async () => {
     engine.analyze.mockResolvedValueOnce({ ...observation(0), live: 0.1 });
     expect((await frame()).verified).toBe(false);

@@ -228,10 +228,18 @@ export class FaceLoginService {
         ? this.decrypt(attempt.samplesCipher)
         : [];
       // Every accepted pose must belong to the same person.
-      if (samples.length && similarity(samples[0], face.embedding) < 0.75)
+      if (samples.length && similarity(samples[0], face.embedding) < 0.75) {
+        if (attempt.mode === 'enroll')
+          return {
+            verified: false,
+            instruction: `Keep the same person in view. ${instruction(direction)}`,
+            step: attempt.step,
+            total: attempt.directions.length,
+          };
         throw new UnauthorizedException(
           'Face does not match. Please try again.',
         );
+      }
       if (attempt.mode === 'verify') {
         const device = await this.prisma.faceLoginDevice.findUnique({
           where: { id: attempt.deviceId },
