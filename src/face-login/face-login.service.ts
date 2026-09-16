@@ -10,7 +10,6 @@ import {
   createDecipheriv,
   createHash,
   randomBytes,
-  randomInt,
   timingSafeEqual,
 } from 'crypto';
 import { PrismaService } from '../prisma/prisma.service';
@@ -131,19 +130,13 @@ export class FaceLoginService {
       where: { expiresAt: { lt: new Date() } },
     });
     const sessionSecret = secret();
-    const turn = randomInt(2) === 0 ? 'left' : 'right';
     const attempt = await this.prisma.faceLoginAttempt.create({
       data: {
         userId,
         deviceId,
         mode,
         secretHash: hash(sessionSecret),
-        directions: [
-          'center',
-          turn,
-          turn === 'left' ? 'right' : 'left',
-          'center',
-        ],
+        directions: ['center'],
         frameHashes: [],
         expiresAt: new Date(Date.now() + 120000),
       },
@@ -153,7 +146,7 @@ export class FaceLoginService {
       secret: sessionSecret,
       instruction: instruction('center'),
       step: 0,
-      total: 4,
+      total: attempt.directions.length,
     };
   }
 
@@ -222,7 +215,7 @@ export class FaceLoginService {
           verified: false,
           instruction: retry,
           step: attempt.step,
-          total: 4,
+          total: attempt.directions.length,
         };
       const samples = attempt.samplesCipher
         ? this.decrypt(attempt.samplesCipher)
@@ -284,7 +277,7 @@ export class FaceLoginService {
           verified: false,
           instruction: instruction(attempt.directions[step]),
           step,
-          total: 4,
+          total: attempt.directions.length,
         };
       const session = await this.users.completeFaceLogin(
         attempt.userId,

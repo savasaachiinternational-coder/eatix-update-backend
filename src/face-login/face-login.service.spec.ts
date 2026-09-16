@@ -12,7 +12,7 @@ describe('camera face login authorization', () => {
   let device: any;
   const key = 'challenge-secret';
   const hash = (value) => createHash('sha256').update(value).digest('hex');
-  const observation = (yaw) => ({
+  const observation = (yaw = 0) => ({
     count: 1,
     embedding: Array(128).fill(1),
     score: 0.99,
@@ -30,7 +30,7 @@ describe('camera face login authorization', () => {
       userId: 'user',
       secretHash: hash(key),
       mode: 'enroll',
-      directions: ['center', 'left', 'right', 'center'],
+      directions: ['center'],
       step: 0,
       frames: 0,
       frameHashes: [],
@@ -93,17 +93,10 @@ describe('camera face login authorization', () => {
   });
 
   async function enroll() {
-    for (const [index, yaw] of [0, 0.3, -0.3, 0].entries()) {
-      engine.analyze.mockResolvedValueOnce(observation(yaw));
-      const result = await frame(index);
-      if (index < 3) {
-        expect(result.verified).toBe(false);
-        expect(prisma.faceLoginDevice.create).not.toHaveBeenCalled();
-      } else return result;
-    }
+    return frame(0);
   }
 
-  it('enrolls only after every pose, encrypts templates and hashes device credentials', async () => {
+  it('enrolls after a single centered pose, encrypts templates and hashes device credentials', async () => {
     const result: any = await enroll();
     expect(result.verified).toBe(true);
     expect(result.session).toBeUndefined();
@@ -114,7 +107,7 @@ describe('camera face login authorization', () => {
     expect(attempt.completed).toBe(true);
   });
 
-  it('issues a fresh login session only after live frames match the registered face', async () => {
+  it('issues a fresh login session after a live frame matches the registered face', async () => {
     await enroll();
     attempt = {
       ...attempt,
@@ -126,18 +119,12 @@ describe('camera face login authorization', () => {
       frameHashes: [],
     };
     users.completeFaceLogin.mockClear();
-    for (const [index, yaw] of [0, 0.3, -0.3, 0].entries()) {
-      engine.analyze.mockResolvedValueOnce(observation(yaw));
-      const result: any = await frame(index + 10);
-      if (index < 3) {
-        expect(result.session).toBeUndefined();
-        expect(users.completeFaceLogin).not.toHaveBeenCalled();
-      } else
-        expect(result.session).toEqual({
-          userId: 'user',
-          token: 'fresh-login-token',
-        });
-    }
+    const result: any = await frame(10);
+    expect(result.session).toEqual({
+      userId: 'user',
+      token: 'fresh-login-token',
+    });
+    expect(users.completeFaceLogin).toHaveBeenCalled();
   });
 
   it('blocks another face and consumes the attempt without issuing credentials', async () => {
@@ -159,27 +146,6 @@ describe('camera face login authorization', () => {
     await expect(frame(10)).rejects.toThrow('Face does not match');
     expect(attempt.completed).toBe(true);
     expect(users.completeFaceLogin).not.toHaveBeenCalled();
-  });
-
-  it('retries an inconsistent enrollment frame without saving it or ending registration', async () => {
-    await frame(0);
-    const savedSamples = attempt.samplesCipher;
-    engine.analyze.mockResolvedValueOnce({
-      ...observation(0.3),
-      embedding: Array(128).fill(20),
-    });
-    const retry = await frame(1);
-    expect(retry.verified).toBe(false);
-    expect(retry.instruction).toContain('Keep the same person');
-    expect(attempt.step).toBe(1);
-    expect(attempt.completed).toBe(false);
-    expect(attempt.samplesCipher).toBe(savedSamples);
-    expect(prisma.faceLoginDevice.create).not.toHaveBeenCalled();
-    for (const [index, yaw] of [0.3, -0.3, 0].entries()) {
-      engine.analyze.mockResolvedValueOnce(observation(yaw));
-      const result = await frame(index + 2);
-      expect(result.verified).toBe(index === 2);
-    }
   });
 
   it('does not advance when liveness checks fail', async () => {
