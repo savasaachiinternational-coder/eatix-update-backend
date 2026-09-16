@@ -33,7 +33,7 @@ export function instruction(direction: string): string {
     return 'Slowly turn your head slightly to your left';
   if (direction === 'right')
     return 'Slowly turn your head slightly to your right';
-  return 'Look straight at the camera';
+  return 'Look straight at the camera and hold still';
 }
 
 export function checkFrame(
@@ -43,10 +43,12 @@ export function checkFrame(
   if (face.count !== 1)
     return face.count
       ? 'Only one person should be in the camera'
-      : 'Position your face inside the circle';
+      : 'Look straight at the camera and hold still in the circle';
   if (
     !validEmbedding(face.embedding) ||
-    !(face.score >= 0.9) ||
+    // Detection quality is separate from the identity and liveness thresholds.
+    // Use the same confidence floor as the face detector.
+    !(face.score >= 0.8) ||
     !(face.size >= 100)
   )
     return 'Move closer and use brighter lighting';

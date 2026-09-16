@@ -12,6 +12,36 @@ describe('packaged face recognition engine', () => {
   });
   afterEach(() => engine.onModuleDestroy());
 
+  it.each([
+    [360, 640],
+    [640, 360],
+    [400, 700],
+  ])(
+    'detects a face in a %i x %i camera frame without stretching it',
+    async (width, height) => {
+      const sample = join(
+        dirname(require.resolve('@vladmandic/human')),
+        '../assets/screenshot-faceid.jpg',
+      );
+      const face = await sharp(sample)
+        .extract({ left: 14, top: 142, width: 140, height: 140 })
+        .resize(300, 300)
+        .jpeg()
+        .toBuffer();
+      const frame = await sharp({
+        create: { width, height, channels: 3, background: '#333333' },
+      })
+        .composite([{ input: face, gravity: 'center' }])
+        .jpeg()
+        .toBuffer();
+      const result = await engine.analyze(frame);
+      expect(result.count).toBe(1);
+      expect(result.embedding).toHaveLength(1024);
+      expect(result.embedding.every(Number.isFinite)).toBe(true);
+    },
+    30000,
+  );
+
   it('extracts a finite identity descriptor, rejects invalid input and recovers', async () => {
     const sample = join(
       dirname(require.resolve('@vladmandic/human')),

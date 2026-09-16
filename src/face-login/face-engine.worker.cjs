@@ -74,7 +74,9 @@ async function analyze(bytes) {
     limitInputPixels: 16000000,
   })
     .rotate()
-    .resize(640, 640, { fit: 'inside', withoutEnlargement: true })
+    // BlazeFace resizes its tensor to a square. Letterbox here so portrait
+    // camera frames preserve face proportions instead of being stretched.
+    .resize(640, 640, { fit: 'contain', background: '#000000' })
     .removeAlpha()
     .toColourspace('srgb')
     .raw()
