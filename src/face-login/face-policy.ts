@@ -1,4 +1,9 @@
 export const FACE_MODEL = 'human-3.3.6-faceres';
+const FACE_CONFIDENCE_MIN = 0.8;
+// Human's Face ID demo uses 0.6 for these model scores. Requiring 0.9
+// rejects clear live frames from common front-facing cameras.
+const ANTISPOOF_MIN = 0.6;
+const LIVENESS_MIN = 0.6;
 export type Observation = {
   count: number;
   embedding?: number[];
@@ -48,11 +53,11 @@ export function checkFrame(
     !validEmbedding(face.embedding) ||
     // Detection quality is separate from the identity and liveness thresholds.
     // Use the same confidence floor as the face detector.
-    !(face.score >= 0.8) ||
+    !(face.score >= FACE_CONFIDENCE_MIN) ||
     !(face.size >= 100)
   )
     return 'Move closer and use brighter lighting';
-  if (!(face.real >= 0.9) || !(face.live >= 0.9))
+  if (!(face.real >= ANTISPOOF_MIN) || !(face.live >= LIVENESS_MIN))
     return 'Use your live face in good lighting';
   if (
     !Number.isFinite(face.yaw) ||
