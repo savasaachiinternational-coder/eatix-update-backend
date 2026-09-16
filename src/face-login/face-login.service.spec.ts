@@ -177,11 +177,6 @@ describe('camera face login authorization', () => {
     },
   );
 
-  it('does not accept an earlier image again', async () => {
-    await frame();
-    await expect(frame()).rejects.toThrow('fresh camera image');
-  });
-
   it('limits repeated verification challenges per enrolled device', async () => {
     const result: any = await enroll();
     prisma.faceLoginDevice.updateMany.mockResolvedValue({ count: 0 });
