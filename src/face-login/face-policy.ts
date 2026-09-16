@@ -4,6 +4,12 @@ const FACE_CONFIDENCE_MIN = 0.8;
 // rejects clear live frames from common front-facing cameras.
 const ANTISPOOF_MIN = 0.6;
 const LIVENESS_MIN = 0.6;
+// Antispoof/liveness scores drop for genuine users too once the head turns
+// off-axis (the models are tuned on frontal faces); a live person completing
+// a randomized left/right prompt within the attempt's time limit is already
+// strong liveness evidence, so turned steps get a lower floor than center.
+const TURN_ANTISPOOF_MIN = 0.4;
+const TURN_LIVENESS_MIN = 0.4;
 export type Observation = {
   count: number;
   embedding?: number[];
@@ -57,7 +63,9 @@ export function checkFrame(
     !(face.size >= 100)
   )
     return 'Move closer and use brighter lighting';
-  if (!(face.real >= ANTISPOOF_MIN) || !(face.live >= LIVENESS_MIN))
+  const antispoofMin = direction === 'center' ? ANTISPOOF_MIN : TURN_ANTISPOOF_MIN;
+  const livenessMin = direction === 'center' ? LIVENESS_MIN : TURN_LIVENESS_MIN;
+  if (!(face.real >= antispoofMin) || !(face.live >= livenessMin))
     return 'Use your live face in good lighting';
   if (
     !Number.isFinite(face.yaw) ||

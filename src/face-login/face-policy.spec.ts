@@ -46,6 +46,20 @@ describe('camera face validation', () => {
       checkFrame({ ...face, score: 0.85, live: 0.59 }, 'center'),
     ).not.toBeNull();
   });
+  it('lowers the liveness floor for turned poses in both directions equally', () => {
+    expect(
+      checkFrame({ ...face, yaw: 0.3, real: 0.45, live: 0.45 }, 'left'),
+    ).toBeNull();
+    expect(
+      checkFrame({ ...face, yaw: -0.3, real: 0.45, live: 0.45 }, 'right'),
+    ).toBeNull();
+    expect(
+      checkFrame({ ...face, yaw: 0, real: 0.59, live: 0.99 }, 'center'),
+    ).not.toBeNull();
+    expect(
+      checkFrame({ ...face, yaw: 0.3, real: 0.3, live: 0.45 }, 'left'),
+    ).not.toBeNull();
+  });
   it('rejects malformed embeddings and distinguishes different descriptors', () => {
     expect(similarity(face.embedding, [...face.embedding])).toBe(1);
     expect(similarity(face.embedding, Array(128).fill(20))).toBe(0);
