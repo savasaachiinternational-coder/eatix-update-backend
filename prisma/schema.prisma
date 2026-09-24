@@ -1393,6 +1393,9 @@ views           VideoView[]    @relation("VideoViews")
   @@index([createdAt])
   @@index([viewCount])
   @@index([scheduledPublishAt])
+  @@index([status, visibility, createdAt(sort: Desc), id(sort: Desc)])
+  @@index([status, visibility, viewCount(sort: Desc), id(sort: Desc)])
+  @@index([userId, createdAt(sort: Desc)])
 }
 
 model VideoLike {
@@ -1727,6 +1730,9 @@ model Short {
   @@index([createdAt])
   @@index([viewCount])
   @@index([isLive])
+  @@index([status, visibility, createdAt(sort: Desc), id(sort: Desc)])
+  @@index([status, visibility, viewCount(sort: Desc), id(sort: Desc)])
+  @@index([userId, createdAt(sort: Desc)])
 }
 
 model ShortLike {

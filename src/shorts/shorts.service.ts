@@ -29,20 +29,12 @@ import {
 } from './dto/shorts.dto';
 import { ShortsTranscodeService } from './shorts-transcode.service';
 import { NoLogoCreditsService } from '../no-logo-credits/no-logo-credits.service';
-import {
-  extractVideoThumbnailFromPath,
-} from '../common/video-thumbnail.util';
+import { extractVideoThumbnailFromPath } from '../common/video-thumbnail.util';
 import { withNormalizedShortVideoUrl } from '../common/normalize-short-video-url.util';
 import { UK_DEFAULT_RADIUS_KM } from '../common/geo.util';
 import { resolveNearbyUserIds } from '../common/nearby-users.cache';
-import {
-  SHORT_CARD_SELECT,
-  clampListLimit,
-} from '../common/media-list-select';
-import {
-  cacheGetOrSet,
-  roundCoordBucket,
-} from '../common/ttl-cache.util';
+import { SHORT_CARD_SELECT, clampListLimit } from '../common/media-list-select';
+import { cacheGetOrSet, roundCoordBucket } from '../common/ttl-cache.util';
 import {
   assertViewerCanSeeCreatorContent,
   canViewerSeeCreatorContent,
@@ -50,6 +42,11 @@ import {
   normalizeViewerRole,
 } from '../common/content-visibility.util';
 import { v4 as uuidv4 } from 'uuid';
+import {
+  decodeFeedCursor,
+  encodeFeedCursor,
+  FeedCursor,
+} from '../common/feed-cursor.util';
 
 @Injectable()
 export class ShortsService {
@@ -69,7 +66,10 @@ export class ShortsService {
     return dto?.watermark !== false;
   }
 
-  private async prepareWatermarkOption(userId: string, dto: { watermark?: boolean }) {
+  private async prepareWatermarkOption(
+    userId: string,
+    dto: { watermark?: boolean },
+  ) {
     const withLogo = this.wantsWatermark(dto);
     if (!withLogo) {
       await this.noLogoCredits.assertCanSkipWatermark(userId);
@@ -336,7 +336,8 @@ export class ShortsService {
         }
       }
       if (!thumbnailUrl && processedPath) {
-        thumbnailUrl = await this.uploadShortThumbnailFromVideoPath(processedPath);
+        thumbnailUrl =
+          await this.uploadShortThumbnailFromVideoPath(processedPath);
       }
 
       const normalizedTags = (() => {
@@ -574,9 +575,7 @@ export class ShortsService {
               thumbMime = 'image/jpeg';
             }
           } catch (e: any) {
-            this.logger.warn(
-              `Thumbnail watermark failed: ${e?.message || e}`,
-            );
+            this.logger.warn(`Thumbnail watermark failed: ${e?.message || e}`);
           }
         }
         const thumb = thumbPath
@@ -752,7 +751,8 @@ export class ShortsService {
     const data: Prisma.ShortUpdateInput = {};
     const cleanupPaths = new Set<string>();
     if ((videoFile as any)?.path) cleanupPaths.add((videoFile as any).path);
-    if ((thumbnailFile as any)?.path) cleanupPaths.add((thumbnailFile as any).path);
+    if ((thumbnailFile as any)?.path)
+      cleanupPaths.add((thumbnailFile as any).path);
 
     try {
       if (videoFile) {
@@ -766,9 +766,12 @@ export class ShortsService {
             `eatix-replace-wm-${Date.now()}.mp4`,
           );
           try {
-            const processed = await this.shortsTranscode.processFile(videoPath, {
-              watermark: true,
-            } as CreateShortDto);
+            const processed = await this.shortsTranscode.processFile(
+              videoPath,
+              {
+                watermark: true,
+              } as CreateShortDto,
+            );
             if (processed && processed !== videoPath) {
               cleanupPaths.add(processed);
               videoPath = processed;
@@ -805,7 +808,10 @@ export class ShortsService {
             `eatix-replace-thumb-wm-${Date.now()}.jpg`,
           );
           try {
-            await this.shortsTranscode.applyWatermarkToImage(thumbPath, wmThumb);
+            await this.shortsTranscode.applyWatermarkToImage(
+              thumbPath,
+              wmThumb,
+            );
             cleanupPaths.add(wmThumb);
             thumbPath = wmThumb;
             thumbName = 'thumb.jpg';
@@ -945,12 +951,17 @@ export class ShortsService {
       radiusKm = UK_DEFAULT_RADIUS_KM,
       viewerRole,
       fields = 'full',
+      cursor,
     } = query;
     const limit = clampListLimit(limitRaw, 20, 50);
     const isCard = fields === 'card';
     const skip = (page - 1) * limit;
+    // Keyset mode (opt-in): no OFFSET scan and no COUNT(*) — constant cost per page.
+    const useKeyset = typeof cursor === 'string' && cursor.length > 0;
+    const keysetAfter = useKeyset ? decodeFeedCursor(cursor) : null;
 
     const canCache =
+      !useKeyset &&
       isCard &&
       page === 1 &&
       !search &&
@@ -963,87 +974,223 @@ export class ShortsService {
       : '';
 
     const load = async () => {
-    const where: any = {
-      status: 'ready',
-      visibility: 'public',
-      AND: [this.publicShortPublishedWhere()],
+      const where: any = {
+        status: 'ready',
+        visibility: 'public',
+        AND: [this.publicShortPublishedWhere()],
+      };
+
+      const roleFilter = creatorRoleWhereForViewer(viewerRole);
+      if (roleFilter) {
+        where.user = roleFilter;
+      }
+
+      if (userId) where.userId = userId;
+      if (nearbyLat != null && nearbyLng != null) {
+        const nearbyUserIds = await resolveNearbyUserIds(
+          this.prisma,
+          nearbyLat,
+          nearbyLng,
+          radiusKm,
+          viewerRole,
+        );
+        where.userId = { in: nearbyUserIds.length > 0 ? nearbyUserIds : [''] };
+      }
+      if (category) where.category = category;
+      if (isLive !== undefined) where.isLive = isLive;
+      if (search) {
+        where.AND.push({
+          OR: [
+            { title: { contains: search, mode: 'insensitive' } },
+            { description: { contains: search, mode: 'insensitive' } },
+          ],
+        });
+      }
+
+      const orderBy =
+        sort === 'trending'
+          ? { viewCount: 'desc' as const }
+          : { createdAt: 'desc' as const };
+
+      if (useKeyset) {
+        return this.getShortsKeyset(
+          where,
+          sort,
+          limit,
+          keysetAfter,
+          isCard,
+          viewerUserId,
+        );
+      }
+
+      const [shorts, total] = await Promise.all([
+        isCard
+          ? this.prisma.short.findMany({
+              where,
+              skip,
+              take: limit,
+              orderBy,
+              select: SHORT_CARD_SELECT,
+            })
+          : this.prisma.short.findMany({
+              where,
+              skip,
+              take: limit,
+              orderBy,
+              include: {
+                user: {
+                  select: {
+                    id: true,
+                    name: true,
+                    nickname: true,
+                    role: true,
+                    photos: true,
+                    latitude: true,
+                    longitude: true,
+                  },
+                },
+                _count: {
+                  select: {
+                    likes: true,
+                    comments: true,
+                    views: true,
+                  },
+                },
+              },
+            }),
+        this.prisma.short.count({ where }),
+      ]);
+
+      let resultShorts: any[] = shorts as any[];
+      if (viewerUserId && shorts.length > 0) {
+        const shortIds = shorts.map((s) => s.id);
+        const ownerIds = Array.from(
+          new Set(shorts.map((s) => s.userId).filter(Boolean)),
+        );
+        const [likedRows, subRows] = await Promise.all([
+          this.prisma.shortLike.findMany({
+            where: { userId: viewerUserId, shortId: { in: shortIds } },
+            select: { shortId: true },
+          }),
+          ownerIds.length
+            ? this.prisma.channelSubscription.findMany({
+                where: {
+                  subscriberId: viewerUserId,
+                  channelUserId: { in: ownerIds },
+                },
+                select: { channelUserId: true },
+              })
+            : Promise.resolve([]),
+        ]);
+        const likedSet = new Set(likedRows.map((r) => r.shortId));
+        const subscribedSet = new Set(subRows.map((r) => r.channelUserId));
+        resultShorts = shorts.map((s: any) => ({
+          ...s,
+          isLiked: likedSet.has(s.id),
+          user: s.user
+            ? { ...s.user, isSubscribed: subscribedSet.has(s.userId) }
+            : s.user,
+        }));
+      }
+
+      return {
+        shorts: resultShorts.map((s) => withNormalizedShortVideoUrl(s)),
+        pagination: {
+          total,
+          page,
+          limit,
+          totalPages: Math.ceil(total / limit),
+        },
+      };
     };
 
-    const roleFilter = creatorRoleWhereForViewer(viewerRole);
-    if (roleFilter) {
-      where.user = roleFilter;
+    if (canCache && cacheKey) {
+      return cacheGetOrSet(cacheKey, 30_000, load);
     }
+    return load();
+  }
 
-    if (userId) where.userId = userId;
-    if (nearbyLat != null && nearbyLng != null) {
-      const nearbyUserIds = await resolveNearbyUserIds(
-        this.prisma,
-        nearbyLat,
-        nearbyLng,
-        radiusKm,
-        viewerRole,
-      );
-      where.userId = { in: nearbyUserIds.length > 0 ? nearbyUserIds : [''] };
+  /**
+   * Keyset page for getShorts (cursor mode). Orders by (createdAt|viewCount, id) desc
+   * so ties are stable, fetches limit+1 to know if more exist, and never counts.
+   */
+  private async getShortsKeyset(
+    baseWhere: any,
+    sort: string | undefined,
+    limit: number,
+    after: FeedCursor | null,
+    isCard: boolean,
+    viewerUserId?: string,
+  ) {
+    const trending = sort === 'trending';
+    const where: any = { ...baseWhere, AND: [...(baseWhere.AND || [])] };
+    if (after) {
+      if (trending && typeof after.v === 'number') {
+        where.AND.push({
+          OR: [
+            { viewCount: { lt: after.v } },
+            { viewCount: after.v, id: { lt: after.id } },
+          ],
+        });
+      } else if (!trending && typeof after.v === 'string') {
+        const at = new Date(after.v);
+        where.AND.push({
+          OR: [
+            { createdAt: { lt: at } },
+            { createdAt: at, id: { lt: after.id } },
+          ],
+        });
+      }
     }
-    if (category) where.category = category;
-    if (isLive !== undefined) where.isLive = isLive;
-    if (search) {
-      where.AND.push({
-        OR: [
-          { title: { contains: search, mode: 'insensitive' } },
-          { description: { contains: search, mode: 'insensitive' } },
-        ],
-      });
-    }
+    const orderBy = trending
+      ? [{ viewCount: 'desc' as const }, { id: 'desc' as const }]
+      : [{ createdAt: 'desc' as const }, { id: 'desc' as const }];
 
-    const orderBy =
-      sort === 'trending'
-        ? { viewCount: 'desc' as const }
-        : { createdAt: 'desc' as const };
-
-    const [shorts, total] = await Promise.all([
-      isCard
-        ? this.prisma.short.findMany({
-            where,
-            skip,
-            take: limit,
-            orderBy,
-            select: SHORT_CARD_SELECT,
-          })
-        : this.prisma.short.findMany({
-            where,
-            skip,
-            take: limit,
-            orderBy,
-            include: {
-              user: {
-                select: {
-                  id: true,
-                  name: true,
-                  nickname: true,
-                  role: true,
-                  photos: true,
-                  latitude: true,
-                  longitude: true,
-                },
-              },
-              _count: {
-                select: {
-                  likes: true,
-                  comments: true,
-                  views: true,
-                },
+    const rows: any[] = isCard
+      ? await this.prisma.short.findMany({
+          where,
+          take: limit + 1,
+          orderBy,
+          select: { ...SHORT_CARD_SELECT, createdAt: true, viewCount: true },
+        })
+      : await this.prisma.short.findMany({
+          where,
+          take: limit + 1,
+          orderBy,
+          include: {
+            user: {
+              select: {
+                id: true,
+                name: true,
+                nickname: true,
+                role: true,
+                photos: true,
+                latitude: true,
+                longitude: true,
               },
             },
-          }),
-      this.prisma.short.count({ where }),
-    ]);
+            _count: { select: { likes: true, comments: true, views: true } },
+          },
+        });
 
-    let resultShorts: any[] = shorts as any[];
-    if (viewerUserId && shorts.length > 0) {
-      const shortIds = shorts.map((s) => s.id);
+    const hasMore = rows.length > limit;
+    const pageRows = hasMore ? rows.slice(0, limit) : rows;
+    const last = pageRows[pageRows.length - 1];
+    const nextCursor =
+      hasMore && last
+        ? encodeFeedCursor({
+            v: trending
+              ? Number(last.viewCount ?? 0)
+              : new Date(last.createdAt).toISOString(),
+            id: String(last.id),
+          })
+        : null;
+
+    let result: any[] = pageRows;
+    if (viewerUserId && pageRows.length > 0) {
+      const shortIds = pageRows.map((s) => s.id);
       const ownerIds = Array.from(
-        new Set(shorts.map((s) => s.userId).filter(Boolean)),
+        new Set(pageRows.map((s) => s.userId).filter(Boolean)),
       );
       const [likedRows, subRows] = await Promise.all([
         this.prisma.shortLike.findMany({
@@ -1062,7 +1209,7 @@ export class ShortsService {
       ]);
       const likedSet = new Set(likedRows.map((r) => r.shortId));
       const subscribedSet = new Set(subRows.map((r) => r.channelUserId));
-      resultShorts = shorts.map((s: any) => ({
+      result = pageRows.map((s: any) => ({
         ...s,
         isLiked: likedSet.has(s.id),
         user: s.user
@@ -1072,20 +1219,9 @@ export class ShortsService {
     }
 
     return {
-      shorts: resultShorts.map((s) => withNormalizedShortVideoUrl(s)),
-      pagination: {
-        total,
-        page,
-        limit,
-        totalPages: Math.ceil(total / limit),
-      },
+      shorts: result.map((s) => withNormalizedShortVideoUrl(s)),
+      pagination: { limit, hasMore, nextCursor },
     };
-    };
-
-    if (canCache && cacheKey) {
-      return cacheGetOrSet(cacheKey, 30_000, load);
-    }
-    return load();
   }
 
   /**

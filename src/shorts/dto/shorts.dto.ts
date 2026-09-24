@@ -11,6 +11,7 @@ import {
   IsDateString,
   Max,
   IsIn,
+  MaxLength,
 } from 'class-validator';
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 import { Type, Transform } from 'class-transformer';
@@ -720,6 +721,16 @@ export class ShortQueryDto {
   @Min(1)
   @Max(50)
   limit?: number;
+
+  @ApiPropertyOptional({
+    description:
+      'Keyset pagination: send "start" for the first page, then the returned pagination.nextCursor. ' +
+      'Skips OFFSET and COUNT(*) so deep pages stay fast. When omitted, page/limit is used as before.',
+  })
+  @IsOptional()
+  @IsString()
+  @MaxLength(200)
+  cursor?: string;
 
   @ApiPropertyOptional({
     description:
