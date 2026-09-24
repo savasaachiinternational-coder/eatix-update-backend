@@ -68,6 +68,7 @@ import { AppRatingModule } from './app-rating/app-rating.module';
 import { SocialAccountsModule } from './social-accounts/social-accounts.module';
 import { SocialAuthModule } from './social-auth/social-auth.module';
 import { PaymentsModule } from './payments/payments.module';
+import { HomeModule } from './home/home.module';
 import { NoLogoCreditsModule } from './no-logo-credits/no-logo-credits.module';
 
 @Module({
@@ -131,6 +132,7 @@ import { NoLogoCreditsModule } from './no-logo-credits/no-logo-credits.module';
     SubscriptionModule,
     SponsoredModule,
     FeaturedModule,
+    HomeModule,
     MenuModule,
     RestaurantOrderModule,
     RestaurantBookingModule,

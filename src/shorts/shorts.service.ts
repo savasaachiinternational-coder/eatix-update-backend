@@ -36,6 +36,14 @@ import { withNormalizedShortVideoUrl } from '../common/normalize-short-video-url
 import { UK_DEFAULT_RADIUS_KM } from '../common/geo.util';
 import { resolveNearbyUserIds } from '../common/nearby-users.cache';
 import {
+  SHORT_CARD_SELECT,
+  clampListLimit,
+} from '../common/media-list-select';
+import {
+  cacheGetOrSet,
+  roundCoordBucket,
+} from '../common/ttl-cache.util';
+import {
   assertViewerCanSeeCreatorContent,
   canViewerSeeCreatorContent,
   creatorRoleWhereForViewer,
@@ -930,15 +938,31 @@ export class ShortsService {
       search,
       isLive,
       page = 1,
-      limit = 20,
+      limit: limitRaw = 20,
       sort,
       nearbyLat,
       nearbyLng,
       radiusKm = UK_DEFAULT_RADIUS_KM,
       viewerRole,
+      fields = 'full',
     } = query;
+    const limit = clampListLimit(limitRaw, 20, 50);
+    const isCard = fields === 'card';
     const skip = (page - 1) * limit;
 
+    const canCache =
+      isCard &&
+      page === 1 &&
+      !search &&
+      !userId &&
+      !category &&
+      isLive === undefined;
+
+    const cacheKey = canCache
+      ? `shorts:card:p1:${roundCoordBucket(Number(nearbyLat))}:${roundCoordBucket(Number(nearbyLng))}:${radiusKm}:${viewerRole || 'any'}:${sort || 'latest'}:vu${viewerUserId || 'anon'}:l${limit}`
+      : '';
+
+    const load = async () => {
     const where: any = {
       status: 'ready',
       visibility: 'public',
@@ -978,32 +1002,40 @@ export class ShortsService {
         : { createdAt: 'desc' as const };
 
     const [shorts, total] = await Promise.all([
-      this.prisma.short.findMany({
-        where,
-        skip,
-        take: limit,
-        orderBy,
-        include: {
-          user: {
-            select: {
-              id: true,
-              name: true,
-              nickname: true,
-              role: true,
-              photos: true,
-              latitude: true,
-              longitude: true,
+      isCard
+        ? this.prisma.short.findMany({
+            where,
+            skip,
+            take: limit,
+            orderBy,
+            select: SHORT_CARD_SELECT,
+          })
+        : this.prisma.short.findMany({
+            where,
+            skip,
+            take: limit,
+            orderBy,
+            include: {
+              user: {
+                select: {
+                  id: true,
+                  name: true,
+                  nickname: true,
+                  role: true,
+                  photos: true,
+                  latitude: true,
+                  longitude: true,
+                },
+              },
+              _count: {
+                select: {
+                  likes: true,
+                  comments: true,
+                  views: true,
+                },
+              },
             },
-          },
-          _count: {
-            select: {
-              likes: true,
-              comments: true,
-              views: true,
-            },
-          },
-        },
-      }),
+          }),
       this.prisma.short.count({ where }),
     ]);
 
@@ -1048,6 +1080,12 @@ export class ShortsService {
         totalPages: Math.ceil(total / limit),
       },
     };
+    };
+
+    if (canCache && cacheKey) {
+      return cacheGetOrSet(cacheKey, 30_000, load);
+    }
+    return load();
   }
 
   /**

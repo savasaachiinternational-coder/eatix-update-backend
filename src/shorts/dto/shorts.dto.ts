@@ -10,6 +10,7 @@ import {
   Min,
   IsDateString,
   Max,
+  IsIn,
 } from 'class-validator';
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 import { Type, Transform } from 'class-transformer';
@@ -712,12 +713,22 @@ export class ShortQueryDto {
   @Min(1)
   page?: number;
 
-  @ApiPropertyOptional({ description: 'Limit', default: 20 })
+  @ApiPropertyOptional({ description: 'Limit', default: 20, maximum: 50 })
   @IsOptional()
   @Type(() => Number)
   @IsInt()
   @Min(1)
+  @Max(50)
   limit?: number;
+
+  @ApiPropertyOptional({
+    description:
+      'Response shape: full (default) or card (home/list thumbnails — lighter payload)',
+    enum: ['full', 'card'],
+  })
+  @IsOptional()
+  @IsIn(['full', 'card'])
+  fields?: 'full' | 'card';
 
   @ApiPropertyOptional({
     description: 'Sort: latest (default), trending (viewCount desc), random',

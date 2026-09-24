@@ -35,6 +35,14 @@ import {
   creatorRoleWhereForViewer,
   normalizeViewerRole,
 } from '../common/content-visibility.util';
+import {
+  VIDEO_CARD_SELECT,
+  clampListLimit,
+} from '../common/media-list-select';
+import {
+  cacheGetOrSet,
+  roundCoordBucket,
+} from '../common/ttl-cache.util';
 
 @Injectable()
 export class VideoService {
@@ -213,7 +221,7 @@ export class VideoService {
       category,
       search,
       page = 1,
-      limit = 20,
+      limit: limitRaw = 20,
       sort,
       nearbyLat,
       nearbyLng,
@@ -221,10 +229,26 @@ export class VideoService {
       excludeSponsored = false,
       excludeFeatured = false,
       viewerRole,
+      fields = 'full',
     } = query;
 
+    const limit = clampListLimit(limitRaw, 20, 50);
+    const isCard = fields === 'card';
     const skip = (page - 1) * limit;
 
+    // Cache first-page card lists (home) — Redis when REDIS_URL set, else memory.
+    const canCache =
+      isCard &&
+      page === 1 &&
+      !search &&
+      !userId &&
+      !category;
+
+    const cacheKey = canCache
+      ? `videos:card:p1:${roundCoordBucket(Number(nearbyLat))}:${roundCoordBucket(Number(nearbyLng))}:${radiusKm}:${viewerRole || 'any'}:${sort || 'latest'}:xS${excludeSponsored ? 1 : 0}:xF${excludeFeatured ? 1 : 0}:l${limit}`
+      : '';
+
+    const load = async () => {
     const where: any = {
       status: 'ready',
       visibility: 'public',
@@ -306,32 +330,40 @@ export class VideoService {
         : { createdAt: 'desc' as const };
 
     const [videos, total] = await Promise.all([
-      this.prisma.video.findMany({
-        where,
-        skip,
-        take: limit,
-        orderBy,
-        include: {
-          user: {
-            select: {
-              id: true,
-              name: true,
-              nickname: true,
-              role: true,
-              photos: true,
-              latitude: true,
-              longitude: true,
+      isCard
+        ? this.prisma.video.findMany({
+            where,
+            skip,
+            take: limit,
+            orderBy,
+            select: VIDEO_CARD_SELECT,
+          })
+        : this.prisma.video.findMany({
+            where,
+            skip,
+            take: limit,
+            orderBy,
+            include: {
+              user: {
+                select: {
+                  id: true,
+                  name: true,
+                  nickname: true,
+                  role: true,
+                  photos: true,
+                  latitude: true,
+                  longitude: true,
+                },
+              },
+              _count: {
+                select: {
+                  likes: true,
+                  comments: true,
+                  views: true,
+                },
+              },
             },
-          },
-          _count: {
-            select: {
-              likes: true,
-              comments: true,
-              views: true,
-            },
-          },
-        },
-      }),
+          }),
       this.prisma.video.count({ where }),
     ]);
 
@@ -344,6 +376,12 @@ export class VideoService {
         totalPages: Math.ceil(total / limit),
       },
     };
+    };
+
+    if (canCache && cacheKey) {
+      return cacheGetOrSet(cacheKey, 30_000, load);
+    }
+    return load();
   }
 
   /**
